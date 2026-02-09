@@ -4,30 +4,11 @@ import math
 from collections.abc import Mapping
 from typing import Any, Dict, List
 
-import torch
-
 import comfy.sampler_helpers
 import comfy.samplers
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.hooks
-
-
-def _is_tensorish(v: Any) -> bool:
-    if torch.is_tensor(v) or isinstance(v, (int, float, bool, str)):
-        return True
-    if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float, bool, str)) for x in v):
-        return True
-    return False
-
-
-def _has_tensorish_leaf(m: Mapping) -> bool:
-    for v in m.values():
-        if _is_tensorish(v):
-            return True
-        if isinstance(v, Mapping) and _has_tensorish_leaf(v):
-            return True
-    return False
 
 
 def _clone_cond_metadata(cond):
@@ -44,44 +25,6 @@ def _clone_cond_metadata(cond):
     if isinstance(cond, tuple):
         return tuple(_clone_cond_metadata(v) if isinstance(v, (Mapping, list, tuple)) else v for v in cond)
     return cond
-
-
-def _merge_missing_tensor_meta(dst_cond: Any, src_cond: Any) -> Any:
-    """
-    Merge tensor/scalar leaves from src->dst only where dst is missing/None.
-    This keeps bad-model hook filtering intact (hook/control objects are not tensorish),
-    while restoring SDXL-required conditioning (often lives in nested dicts).
-    """
-    if isinstance(dst_cond, Mapping) and isinstance(src_cond, Mapping):
-        if not isinstance(dst_cond, dict):
-            dst_cond = dict(dst_cond)
-        for k, sv in src_cond.items():
-            dv = dst_cond.get(k, None)
-            if dv is not None:
-                if isinstance(dv, Mapping) and isinstance(sv, Mapping) and _has_tensorish_leaf(sv):
-                    dst_cond[k] = _merge_missing_tensor_meta(dv, sv)
-                continue
-
-            if _is_tensorish(sv):
-                dst_cond[k] = sv
-            elif isinstance(sv, Mapping) and _has_tensorish_leaf(sv):
-                dst_cond[k] = _merge_missing_tensor_meta({}, sv)
-        return dst_cond
-
-    if isinstance(dst_cond, list) and isinstance(src_cond, list):
-        n = min(len(dst_cond), len(src_cond))
-        for i in range(n):
-            dst_cond[i] = _merge_missing_tensor_meta(dst_cond[i], src_cond[i])
-        return dst_cond
-
-    if isinstance(dst_cond, tuple) and isinstance(src_cond, tuple):
-        n = min(len(dst_cond), len(src_cond))
-        merged = list(dst_cond)
-        for i in range(n):
-            merged[i] = _merge_missing_tensor_meta(merged[i], src_cond[i])
-        return tuple(merged)
-
-    return dst_cond
 
 
 def _find_first_y(cond: Any):
@@ -166,16 +109,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
             self.bad_model_patcher, noise.shape, self.bad_conds, self.model_options
         )
-        try:
-            if self.bad_conds and self.conds:
-                bad_positive = self.bad_conds.get("positive", None)
-                good_positive = self.conds.get("positive", None)
-                if bad_positive is not None and good_positive is not None:
-                    bad_positive = _clone_cond_metadata(bad_positive)
-                    bad_positive = _merge_missing_tensor_meta(bad_positive, good_positive)
-                    self.bad_conds["positive"] = bad_positive
-        except Exception:
-            pass
+        # SDXL class-conditional models require 'y'. Some hook/filter stacks drop it for the bad model.
+        # Only restore 'y' (do NOT merge other tensors like c_crossattn / embeddings).
+        if self.bad_conds and self.conds:
+            y_ref = _find_first_y(self.conds.get("positive", None)) or _find_first_y(self.conds.get("negative", None))
+            bad_positive = self.bad_conds.get("positive", None)
+            if y_ref is not None and bad_positive is not None:
+                bad_positive = _clone_cond_metadata(bad_positive)
+                _ensure_y_everywhere(bad_positive, y_ref)
+                self.bad_conds["positive"] = bad_positive
 
         seen = set()
         loaded_all = []
@@ -352,11 +294,10 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         else:
             cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
-        # Prefer bad-model filtered conds for hook compatibility, but merge in any missing
-        # tensor/scalar metadata from the good positive cond so SDXL gets its required 'y'.
+        # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
         pos_bad_cond = self.bad_conds["positive"] if self.bad_conds and "positive" in self.bad_conds else positive_cond
 
-        # IMPORTANT: SDXL-style models require the extra "y/adm" inputs.
+        # IMPORTANT: Some SDXL-style class-conditional models require "y".
         # Passing `None` as a second conditioning can drop those and trip
         # "must specify y if and only if the model is class-conditional".
         # So: run ONLY a single conditional forward for the bad model.
