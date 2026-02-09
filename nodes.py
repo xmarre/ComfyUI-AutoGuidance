@@ -229,7 +229,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         else:
             cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
-        pos_bad_cond = (self.bad_conds.get("positive", None) if self.bad_conds else None) or positive_cond
+        # For SDXL, the "bad_conds" version can lose pooled/adm info via hooks.
+        # AutoGuidance expects SAME prompt conditioning; only the model differs.
+        pos_bad_cond = positive_cond
 
         # IMPORTANT: SDXL-style models require the extra "y/adm" inputs.
         # Passing `None` as a second conditioning can drop those and trip
