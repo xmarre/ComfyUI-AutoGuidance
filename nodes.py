@@ -53,12 +53,23 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         if sigmas.shape[-1] == 0:
             return latent_image
 
+        # ComfyUI's prepare_sampling now expects a non-None model_options dict
+        # (wrapper plumbing uses model_options.get(...)).
+        model_options = getattr(self, "model_options", None)
+        if not isinstance(model_options, dict):
+            model_options = {"transformer_options": {}}
+            self.model_options = model_options
+        else:
+            # Some setups may have transformer_options missing/None; make it a dict.
+            if model_options.get("transformer_options", None) is None:
+                model_options["transformer_options"] = {}
+
         self.conds = {}
         for k in self.original_conds:
             self.conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
 
         self.inner_model, self.conds, loaded_good = comfy.sampler_helpers.prepare_sampling(
-            self.model_patcher, noise.shape, self.conds
+            self.model_patcher, noise.shape, self.conds, model_options=model_options
         )
 
         bad_conds = {}
@@ -66,7 +77,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             bad_conds[k] = list(map(lambda a: a.copy(), self.original_conds[k]))
 
         self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
-            self.bad_model_patcher, noise.shape, bad_conds
+            self.bad_model_patcher, noise.shape, bad_conds, model_options=model_options
         )
 
         self.loaded_models = loaded_good + loaded_bad
@@ -108,6 +119,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         """
         if model_options is None:
             model_options = {}
+        # Ensure wrapper-related options always exist
+        if model_options.get("transformer_options", None) is None:
+            model_options["transformer_options"] = {}
+
+        # Keep a reference so sample() can reuse it if needed
+        self.model_options = model_options
 
         positive_cond = self.conds.get("positive", None)
         negative_cond = self.conds.get("negative", None)
