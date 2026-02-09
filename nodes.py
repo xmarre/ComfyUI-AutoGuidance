@@ -10,6 +10,75 @@ import comfy.patcher_extension
 import comfy.hooks
 
 
+def _clone_cond_metadata(cond):
+    """
+    Clone only the conditioning metadata dict(s), not the tensors.
+    Comfy cond items are typically [tensor, {metadata...}, ...].
+    """
+    if not isinstance(cond, list):
+        return cond
+    out = []
+    for item in cond:
+        if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], dict):
+            out.append((item[0], dict(item[1]), *item[2:]))
+        elif isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+            new_item = [item[0], dict(item[1])]
+            if len(item) > 2:
+                new_item.extend(item[2:])
+            out.append(new_item)
+        else:
+            out.append(item)
+    return out
+
+
+def _patch_sdxl_required_extras(dst_cond, src_cond):
+    """
+    Keep dst_cond's hook filtering, but copy SDXL-required extras (y/adm/pooled/etc.)
+    from src_cond if dst_cond is missing them. This avoids:
+      AssertionError: must specify y if and only if the model is class-conditional
+    while preserving bad-model compatibility filtering.
+    """
+    if not isinstance(dst_cond, list) or not isinstance(src_cond, list):
+        return dst_cond
+
+    # Keys observed across SDXL/Comfy variants; copy only if present in src and missing/None in dst.
+    EXTRA_KEYS = (
+        "y",
+        "adm",
+        "pooled_output",
+        "pooled_text_embeds",
+        "added_cond_kwargs",
+        "vector",
+        "time_ids",
+        "text_embeds",
+        "width",
+        "height",
+        "crop_w",
+        "crop_h",
+        "target_width",
+        "target_height",
+    )
+
+    n = min(len(dst_cond), len(src_cond))
+    for i in range(n):
+        d_item = dst_cond[i]
+        s_item = src_cond[i]
+        if (
+            isinstance(d_item, (list, tuple))
+            and len(d_item) >= 2
+            and isinstance(d_item[1], dict)
+            and isinstance(s_item, (list, tuple))
+            and len(s_item) >= 2
+            and isinstance(s_item[1], dict)
+        ):
+            d_dict = d_item[1]
+            s_dict = s_item[1]
+            for k in EXTRA_KEYS:
+                if k in s_dict and (k not in d_dict or d_dict[k] is None):
+                    d_dict[k] = s_dict[k]
+    return dst_cond
+
+
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     """
     AutoGuidance + CFG guider.
@@ -229,9 +298,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         else:
             cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
-        # For SDXL, the "bad_conds" version can lose pooled/adm info via hooks.
-        # AutoGuidance expects SAME prompt conditioning; only the model differs.
-        pos_bad_cond = positive_cond
+        # Use the bad-model filtered conds (keeps hook compatibility), but ensure SDXL-required
+        # extras (y/adm/pooled) exist by copying them from the known-good positive_cond.
+        pos_bad_cond = (self.bad_conds.get("positive", None) if self.bad_conds else None) or positive_cond
+        pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
+        pos_bad_cond = _patch_sdxl_required_extras(pos_bad_cond, positive_cond)
 
         # IMPORTANT: SDXL-style models require the extra "y/adm" inputs.
         # Passing `None` as a second conditioning can drop those and trip
