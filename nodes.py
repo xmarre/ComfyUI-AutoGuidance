@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Any, Dict, List
+
+import torch
 
 import comfy.sampler_helpers
 import comfy.samplers
@@ -10,73 +13,114 @@ import comfy.patcher_extension
 import comfy.hooks
 
 
+def _is_tensorish(v: Any) -> bool:
+    if torch.is_tensor(v) or isinstance(v, (int, float, bool, str)):
+        return True
+    if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float, bool, str)) for x in v):
+        return True
+    return False
+
+
+def _has_tensorish_leaf(m: Mapping) -> bool:
+    for v in m.values():
+        if _is_tensorish(v):
+            return True
+        if isinstance(v, Mapping) and _has_tensorish_leaf(v):
+            return True
+    return False
+
+
 def _clone_cond_metadata(cond):
     """
-    Clone only the conditioning metadata dict(s), not the tensors.
+    Clone only the conditioning metadata containers, not the tensors.
     Comfy cond items are typically [tensor, {metadata...}, ...].
     """
-    if not isinstance(cond, list):
-        return cond
-    out = []
-    for item in cond:
-        if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], dict):
-            out.append((item[0], dict(item[1]), *item[2:]))
-        elif isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
-            new_item = [item[0], dict(item[1])]
-            if len(item) > 2:
-                new_item.extend(item[2:])
-            out.append(new_item)
-        else:
-            out.append(item)
-    return out
+    if isinstance(cond, Mapping):
+        return {
+            k: _clone_cond_metadata(v) if isinstance(v, (Mapping, list, tuple)) else v for k, v in cond.items()
+        }
+    if isinstance(cond, list):
+        return [_clone_cond_metadata(v) if isinstance(v, (Mapping, list, tuple)) else v for v in cond]
+    if isinstance(cond, tuple):
+        return tuple(_clone_cond_metadata(v) if isinstance(v, (Mapping, list, tuple)) else v for v in cond)
+    return cond
 
 
-def _patch_sdxl_required_extras(dst_cond, src_cond):
+def _merge_missing_tensor_meta(dst_cond: Any, src_cond: Any) -> Any:
     """
-    Keep dst_cond's hook filtering, but copy SDXL-required extras (y/adm/pooled/etc.)
-    from src_cond if dst_cond is missing them. This avoids:
-      AssertionError: must specify y if and only if the model is class-conditional
-    while preserving bad-model compatibility filtering.
+    Merge tensor/scalar leaves from src->dst only where dst is missing/None.
+    This keeps bad-model hook filtering intact (hook/control objects are not tensorish),
+    while restoring SDXL-required conditioning (often lives in nested dicts).
     """
-    if not isinstance(dst_cond, list) or not isinstance(src_cond, list):
+    if isinstance(dst_cond, Mapping) and isinstance(src_cond, Mapping):
+        if not isinstance(dst_cond, dict):
+            dst_cond = dict(dst_cond)
+        for k, sv in src_cond.items():
+            dv = dst_cond.get(k, None)
+            if dv is not None:
+                if isinstance(dv, Mapping) and isinstance(sv, Mapping) and _has_tensorish_leaf(sv):
+                    dst_cond[k] = _merge_missing_tensor_meta(dv, sv)
+                continue
+
+            if _is_tensorish(sv):
+                dst_cond[k] = sv
+            elif isinstance(sv, Mapping) and _has_tensorish_leaf(sv):
+                dst_cond[k] = _merge_missing_tensor_meta({}, sv)
         return dst_cond
 
-    # Keys observed across SDXL/Comfy variants; copy only if present in src and missing/None in dst.
-    EXTRA_KEYS = (
-        "y",
-        "adm",
-        "pooled_output",
-        "pooled_text_embeds",
-        "added_cond_kwargs",
-        "vector",
-        "time_ids",
-        "text_embeds",
-        "width",
-        "height",
-        "crop_w",
-        "crop_h",
-        "target_width",
-        "target_height",
-    )
+    if isinstance(dst_cond, list) and isinstance(src_cond, list):
+        n = min(len(dst_cond), len(src_cond))
+        for i in range(n):
+            dst_cond[i] = _merge_missing_tensor_meta(dst_cond[i], src_cond[i])
+        return dst_cond
 
-    n = min(len(dst_cond), len(src_cond))
-    for i in range(n):
-        d_item = dst_cond[i]
-        s_item = src_cond[i]
-        if (
-            isinstance(d_item, (list, tuple))
-            and len(d_item) >= 2
-            and isinstance(d_item[1], dict)
-            and isinstance(s_item, (list, tuple))
-            and len(s_item) >= 2
-            and isinstance(s_item[1], dict)
-        ):
-            d_dict = d_item[1]
-            s_dict = s_item[1]
-            for k in EXTRA_KEYS:
-                if k in s_dict and (k not in d_dict or d_dict[k] is None):
-                    d_dict[k] = s_dict[k]
+    if isinstance(dst_cond, tuple) and isinstance(src_cond, tuple):
+        n = min(len(dst_cond), len(src_cond))
+        merged = list(dst_cond)
+        for i in range(n):
+            merged[i] = _merge_missing_tensor_meta(merged[i], src_cond[i])
+        return tuple(merged)
+
     return dst_cond
+
+
+def _find_first_y(cond: Any):
+    if isinstance(cond, Mapping):
+        y = cond.get("y", None)
+        if y is not None:
+            return y
+        for v in cond.values():
+            if isinstance(v, (Mapping, list, tuple)):
+                y2 = _find_first_y(v)
+                if y2 is not None:
+                    return y2
+        return None
+    if isinstance(cond, (list, tuple)):
+        for v in cond:
+            if isinstance(v, (Mapping, list, tuple)):
+                y2 = _find_first_y(v)
+                if y2 is not None:
+                    return y2
+    return None
+
+
+def _ensure_y_everywhere(cond: Any, y_ref) -> None:
+    if y_ref is None:
+        return
+    if isinstance(cond, Mapping):
+        try:
+            if cond.get("y", None) is None:
+                cond["y"] = y_ref
+        except Exception:
+            pass
+        for v in cond.values():
+            if isinstance(v, (Mapping, list, tuple)):
+                _ensure_y_everywhere(v, y_ref)
+        return
+    if isinstance(cond, (list, tuple)):
+        for v in cond:
+            if isinstance(v, (Mapping, list, tuple)):
+                _ensure_y_everywhere(v, y_ref)
 
 
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
@@ -122,6 +166,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
             self.bad_model_patcher, noise.shape, self.bad_conds, self.model_options
         )
+        try:
+            if self.bad_conds and self.conds:
+                bad_positive = self.bad_conds.get("positive", None)
+                good_positive = self.conds.get("positive", None)
+                if bad_positive is not None and good_positive is not None:
+                    bad_positive = _clone_cond_metadata(bad_positive)
+                    bad_positive = _merge_missing_tensor_meta(bad_positive, good_positive)
+                    self.bad_conds["positive"] = bad_positive
+        except Exception:
+            pass
 
         seen = set()
         loaded_all = []
@@ -298,11 +352,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         else:
             cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
 
-        # Use the bad-model filtered conds (keeps hook compatibility), but ensure SDXL-required
-        # extras (y/adm/pooled) exist by copying them from the known-good positive_cond.
-        pos_bad_cond = (self.bad_conds.get("positive", None) if self.bad_conds else None) or positive_cond
-        pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
-        pos_bad_cond = _patch_sdxl_required_extras(pos_bad_cond, positive_cond)
+        # Prefer bad-model filtered conds for hook compatibility, but merge in any missing
+        # tensor/scalar metadata from the good positive cond so SDXL gets its required 'y'.
+        pos_bad_cond = self.bad_conds["positive"] if self.bad_conds and "positive" in self.bad_conds else positive_cond
 
         # IMPORTANT: SDXL-style models require the extra "y/adm" inputs.
         # Passing `None` as a second conditioning can drop those and trip
@@ -310,13 +362,32 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         # So: run ONLY a single conditional forward for the bad model.
         conds_bad_single: List[Any] = [pos_bad_cond]
         self.inner_bad_model.current_patcher = self.bad_model_patcher
-        out_bad_single = comfy.samplers.calc_cond_batch(
-            self.inner_bad_model,
-            conds_bad_single,
-            x,
-            timestep,
-            model_options,
-        )
+        try:
+            out_bad_single = comfy.samplers.calc_cond_batch(
+                self.inner_bad_model,
+                conds_bad_single,
+                x,
+                timestep,
+                model_options,
+            )
+        except AssertionError as e:
+            if "must specify y if and only if the model is class-conditional" not in str(e):
+                raise
+            y_ref = _find_first_y(positive_cond)
+            if y_ref is None:
+                raise
+            pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
+            _ensure_y_everywhere(pos_bad_cond, y_ref)
+            if self.bad_conds is not None:
+                self.bad_conds["positive"] = pos_bad_cond
+            conds_bad_single = [pos_bad_cond]
+            out_bad_single = comfy.samplers.calc_cond_batch(
+                self.inner_bad_model,
+                conds_bad_single,
+                x,
+                timestep,
+                model_options,
+            )
         bad_cond_pred = out_bad_single[0]
 
         # If any pre-cfg hooks exist, provide a 2-slot "view" (duplicate) for compatibility
