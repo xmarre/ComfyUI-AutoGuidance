@@ -55,10 +55,155 @@ def _clone_model_options_for_bad(model_options: Dict[str, Any]) -> Dict[str, Any
     return bad_opts
 
 
+AG_SWAP_MODE_SHARED_SAFE = "shared_safe_low_vram"
+AG_SWAP_MODE_SHARED_FAST = "shared_fast_extra_vram"
+AG_SWAP_MODE_DUAL_MODELS = "dual_models_2x_vram"
+
+AG_SWAP_MODE_CHOICES = [
+    AG_SWAP_MODE_SHARED_SAFE,
+    AG_SWAP_MODE_SHARED_FAST,
+    AG_SWAP_MODE_DUAL_MODELS,
+]
+
+
+def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
+    """
+    Configure shared-model patchers for faster LoRA stack switching.
+    Uses extra VRAM by retaining a shared weight backup on-device.
+    """
+    shared_backup = getattr(model, "_ag_shared_weight_backup", None)
+    if shared_backup is None:
+        shared_backup = {}
+        setattr(model, "_ag_shared_weight_backup", shared_backup)
+
+    for p in (patcher, *peer_patchers):
+        try:
+            p.backup = shared_backup
+        except Exception:
+            pass
+
+        if device is not None:
+            try:
+                p.offload_device = device
+            except Exception:
+                pass
+
+        try:
+            p.weight_inplace_update = True
+        except Exception:
+            pass
+
+
+def _call_unpatch_model_compat(patcher, *, device) -> None:
+    """
+    Unpatch compat across Comfy variants (prefers "cheap" calls first).
+    """
+    try:
+        patcher.unpatch_model(unpatch_weights=True)
+        return
+    except TypeError:
+        pass
+
+    try:
+        if device is not None:
+            patcher.unpatch_model(device_to=device, unpatch_weights=True)
+        else:
+            patcher.unpatch_model(unpatch_weights=True)
+        return
+    except TypeError:
+        pass
+
+    try:
+        if device is not None:
+            patcher.unpatch_model(device, True)
+        else:
+            patcher.unpatch_model()
+        return
+    except Exception:
+        patcher.unpatch_model()
+
+
+def _call_patch_model_fast_weightsafe(patcher, *, device) -> bool:
+    """
+    Fast shared-model swap path:
+    1) patch_model(load_weights=False) for object patches and to avoid reload churn.
+    2) explicitly apply weight deltas via patch_weight_to_device for correctness.
+    Returns False when unsupported so caller can fall back to slow/safe path.
+    """
+    fn = patcher.patch_model
+
+    def _is_sig_typeerror(e: TypeError) -> bool:
+        msg = str(e)
+        return (
+            "unexpected keyword argument" in msg
+            or "got an unexpected keyword argument" in msg
+            or "positional argument" in msg
+            or "required positional argument" in msg
+            or "missing a required keyword-only argument" in msg
+            or "missing required keyword-only argument" in msg
+            or "required keyword-only argument" in msg
+            or "got multiple values for argument" in msg
+            or "multiple values for keyword argument" in msg
+            or ("takes" in msg and "positional" in msg)
+        )
+
+    def _try_patch_model(*, minimal: bool) -> bool:
+        kw = {}
+        if not minimal:
+            if device is not None and _sig_accepts_kw(fn, "device_to"):
+                kw["device_to"] = device
+            if _sig_accepts_kw(fn, "lowvram_model_memory"):
+                kw["lowvram_model_memory"] = 0
+
+        if not _sig_accepts_kw(fn, "load_weights"):
+            return False
+        kw["load_weights"] = False
+
+        if _sig_accepts_kw(fn, "force_patch_weights"):
+            kw["force_patch_weights"] = True
+
+        try:
+            fn(**kw)
+            return True
+        except TypeError as e:
+            if _is_sig_typeerror(e):
+                return False
+            raise
+
+    try:
+        if not _try_patch_model(minimal=True):
+            if not _try_patch_model(minimal=False):
+                return False
+    except Exception:
+        return False
+
+    pwt = getattr(patcher, "patch_weight_to_device", None)
+    patches = getattr(patcher, "patches", None)
+    if pwt is None or not isinstance(patches, dict) or not patches:
+        return False
+
+    for key in list(patches.keys()):
+        try:
+            pwt(key, device_to=device, inplace_update=True)
+        except TypeError:
+            try:
+                pwt(key, device, True)
+            except TypeError:
+                try:
+                    pwt(key)
+                except Exception:
+                    return False
+        except Exception:
+            return False
+
+    return True
+
+
 def _activate_patcher_for_forward(
     patcher: comfy.model_patcher.ModelPatcher,
     *,
     peer_patchers: tuple[comfy.model_patcher.ModelPatcher, ...] = (),
+    fast_weight_swap: bool = False,
 ) -> None:
     m = getattr(patcher, "model", None)
     if m is None:
@@ -67,12 +212,15 @@ def _activate_patcher_for_forward(
     if not hasattr(m, "current_weight_patches_uuid"):
         m.current_weight_patches_uuid = None
 
+    # Opt-in performance mode for shared-model LoRA swapping (costs extra VRAM).
+    # IMPORTANT: only enabled via node/UI.
+    fast_mode = bool(fast_weight_swap)
+
     uuid_only_noop = os.environ.get("AG_UUID_ONLY_NOOP", "0") == "1"
     want_uuid = getattr(patcher, "patches_uuid", None)
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
 
-    # Resolve owner robustly from UUID if current_patcher is stale/missing.
     if cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid:
         resolved = None
         for p in (patcher, *peer_patchers):
@@ -82,15 +230,51 @@ def _activate_patcher_for_forward(
         if resolved is not None:
             cur_owner = resolved
 
-    # Fast no-op ONLY when Comfy's *real* current_patcher already matches.
-    # current_weight_patches_uuid can be stale across prompts/runs; relying on UUID alone
-    # can skip required LoRA weight deltas and causes "washed out" output.
     real_owner = getattr(m, "current_patcher", None)
     if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
         return
 
     device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
+
+    def _unpatch_owner_fast(owner) -> None:
+        if owner is None:
+            return
+        _call_unpatch_model_compat(owner, device=device)
+        m.current_weight_patches_uuid = None
+        if getattr(m, "current_patcher", None) is owner:
+            m.current_patcher = None
+
+    # Try fast path first when explicitly enabled. Fall back to safe path if unsupported.
+    if fast_mode:
+        _prepare_fast_weight_swap(m, patcher, peer_patchers=peer_patchers, device=device)
+        owner = getattr(m, "current_patcher", None) or cur_owner
+        if owner is not None and owner is not patcher:
+            _unpatch_owner_fast(owner)
+        elif owner is patcher and cur_uuid != want_uuid:
+            _unpatch_owner_fast(patcher)
+
+        if _call_patch_model_fast_weightsafe(patcher, device=device):
+            m.current_patcher = patcher
+            m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+            return
+        else:
+            # Fast attempt may have applied partial object patches; clean up before slow path.
+            try:
+                _call_unpatch_model_compat(patcher, device=device)
+            except Exception:
+                pass
+            m.current_weight_patches_uuid = None
+            if getattr(m, "current_patcher", None) is patcher:
+                m.current_patcher = None
+
+            # Important: user explicitly chose fast mode; tell them if we had to fall back.
+            if not hasattr(m, "_ag_warn_fast_unsupported_once"):
+                print(
+                    "[AutoGuidance] shared_fast_extra_vram selected, but fast weight-swap is unsupported on this ComfyUI build "
+                    "(missing/changed patch_weight_to_device or patch structures). Falling back to shared_safe_low_vram."
+                )
+                m._ag_warn_fast_unsupported_once = True
 
     def _unpatch_owner(owner) -> None:
         if owner is None:
@@ -113,17 +297,14 @@ def _activate_patcher_for_forward(
         if getattr(m, "current_patcher", None) is owner:
             m.current_patcher = None
 
-    # Only unpatch the current owner (never blanket-unpatch peers).
     if cur_owner is not None and cur_owner is not patcher:
         _unpatch_owner(cur_owner)
     elif cur_owner is patcher and cur_uuid != want_uuid:
         _unpatch_owner(patcher)
 
-    # Refresh state after unpatch before deciding whether to patch.
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
 
-    # Same rule here: only no-op if the real owner matches (unless explicitly opted in).
     real_owner = getattr(m, "current_patcher", None)
     if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
@@ -149,9 +330,7 @@ def _sig_accepts_kw(fn, name: str) -> bool:
 
 def _call_patch_model_safe(patcher, *, device):
     """
-    Prefer load_weights=False (fast, no reload) if supported.
-    Fall back to load_weights=True only if needed.
-    Works across ComfyUI signature variants.
+    Correctness-first patch path (low VRAM, slower).
     """
     fn = patcher.patch_model
 
@@ -162,11 +341,9 @@ def _call_patch_model_safe(patcher, *, device):
             or "got an unexpected keyword argument" in msg
             or "positional argument" in msg
             or "required positional argument" in msg
-            # Python keyword-only mismatch variants
             or "missing a required keyword-only argument" in msg
             or "missing required keyword-only argument" in msg
             or "required keyword-only argument" in msg
-            # Also a common signature mismatch form
             or "got multiple values for argument" in msg
             or "multiple values for keyword argument" in msg
             or ("takes" in msg and "positional" in msg)
@@ -175,7 +352,6 @@ def _call_patch_model_safe(patcher, *, device):
     def _try(load_weights: bool, force: bool, *, minimal: bool) -> bool:
         kw = {}
 
-        # For the fast path, avoid device management args (they often trigger reload logic).
         if not minimal:
             if device is not None and _sig_accepts_kw(fn, "device_to"):
                 kw["device_to"] = device
@@ -194,25 +370,6 @@ def _call_patch_model_safe(patcher, *, device):
                 return False
             raise
 
-    # Optional fast path toggle for validation/rollback.
-    # Make fast swapping opt-in so default behavior never regresses correctness.
-    # Set AG_FAST_PATCH_SWAP=1 to enable load_weights=False attempts.
-    fast_patch_swap = os.environ.get("AG_FAST_PATCH_SWAP", "0") == "1"
-
-    # FAST: try with device args first (still load_weights=False) — much less likely
-    # to "succeed but not actually patch".
-    if fast_patch_swap and _try(load_weights=False, force=True, minimal=False):
-        return
-    if fast_patch_swap and _try(load_weights=False, force=False, minimal=False):
-        return
-
-    # FAST fallback: minimal kwargs (no device args)
-    if fast_patch_swap and _try(load_weights=False, force=True, minimal=True):
-        return
-    if fast_patch_swap and _try(load_weights=False, force=False, minimal=True):
-        return
-
-    # SLOW correctness fallbacks
     if _try(load_weights=True, force=True, minimal=False):
         return
     if _try(load_weights=True, force=False, minimal=False):
@@ -387,12 +544,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     (same convention used by other custom guiders that subclass CFGGuider).
     """
 
-    def __init__(self, good_model, bad_model):
+    def __init__(self, good_model, bad_model, *, swap_mode: str = AG_SWAP_MODE_SHARED_SAFE):
         super().__init__(good_model)
         self.bad_model_patcher = bad_model
         self.inner_bad_model = None
         self.bad_conds = None
         self.w_ag: float = 1.0  # paper-style weight; (w_ag - 1) is the delta scale
+        self.swap_mode: str = str(swap_mode)
 
     def set_conds(self, positive, negative) -> None:
         # Keep the same conditioning dict style used by CFGGuider-based guiders.
@@ -562,8 +720,25 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         bad_model_options = _clone_model_options_for_bad(model_options)
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
 
+        # 3-mode policy:
+        # - shared_safe_low_vram: always use slow correctness-first patching
+        # - shared_fast_extra_vram: use fast weightsafe swap (extra VRAM)
+        # - dual_models_2x_vram: requires truly distinct model objects; otherwise fall back safely
+        swap_mode = getattr(self, "swap_mode", AG_SWAP_MODE_SHARED_SAFE)
+        if swap_mode == AG_SWAP_MODE_DUAL_MODELS and shared_model:
+            if not hasattr(self, "_ag_warn_dual_shared_once"):
+                print(
+                    "[AutoGuidance] swap_mode=dual_models_2x_vram requested but good/bad share the same base model object; "
+                    "falling back to shared_safe_low_vram to avoid washed-out output. "
+                    "To actually use dual models, load the checkpoint twice as two distinct instances (e.g., via a copied/symlinked file path)."
+                )
+                self._ag_warn_dual_shared_once = True
+            swap_mode = AG_SWAP_MODE_SHARED_SAFE
+
+        fast_swap = (swap_mode == AG_SWAP_MODE_SHARED_FAST)
+
         if shared_model:
-            _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+            _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
 
         if not hasattr(self, "_ag_dbg_once"):
             try:
@@ -589,7 +764,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                     if not hasattr(self, "_ag_dbg_flip_good_once"):
                         m = getattr(self.model_patcher, "model", None)
                         print(
@@ -617,7 +792,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_pre_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "conds": conds_good,
@@ -646,7 +821,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             if "sampler_cfg_function" in model_options:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "cond": x - cond_pred,
@@ -668,7 +843,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 denoised = cfg_out
                 for fn in model_options.get("sampler_post_cfg_function", []):
                     if shared_model:
-                        _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                        _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                     self.inner_model.current_patcher = self.model_patcher
                     denoised = fn(
                         {
@@ -688,7 +863,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         }
                     )
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                 return denoised
 
             # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
@@ -714,7 +889,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_bad(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,))
+                    _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,), fast_weight_swap=fast_swap)
                     if not hasattr(self, "_ag_dbg_flip_bad_once"):
                         m = getattr(self.bad_model_patcher, "model", None)
                         print(
@@ -813,7 +988,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_post_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "denoised": denoised,
@@ -833,12 +1008,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 denoised = fn(args)
 
             if shared_model:
-                _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
             return denoised
         finally:
             try:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
             except Exception:
                 pass
             if self.inner_bad_model is not None:
@@ -865,6 +1040,11 @@ class AutoGuidanceCFGGuider:
                 # Paper-style parameterization:
                 # w_ag = 1.0 => off, 2.0 => moderate, 3.0 => strong
                 "w_autoguide": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 5.0, "step": 0.05, "round": 0.01}),
+                # 3-mode behavior selection:
+                # - shared_safe_low_vram: correctness-first, slow, minimal extra VRAM (default)
+                # - shared_fast_extra_vram: faster shared-model swapping, costs extra VRAM
+                # - dual_models_2x_vram: fastest, but requires truly distinct model instances (~2x VRAM)
+                "swap_mode": (AG_SWAP_MODE_CHOICES, {"default": AG_SWAP_MODE_SHARED_SAFE}),
             }
         }
 
@@ -872,8 +1052,8 @@ class AutoGuidanceCFGGuider:
     FUNCTION = "get_guider"
     CATEGORY = "sampling/guiders"
 
-    def get_guider(self, good_model, bad_model, positive, negative, cfg: float, w_autoguide: float):
-        guider = Guider_AutoGuidanceCFG(good_model, bad_model)
+    def get_guider(self, good_model, bad_model, positive, negative, cfg: float, w_autoguide: float, swap_mode=AG_SWAP_MODE_SHARED_SAFE):
+        guider = Guider_AutoGuidanceCFG(good_model, bad_model, swap_mode=swap_mode)
         guider.set_conds(positive, negative)
         guider.set_scales(cfg=cfg, w_ag=w_autoguide)
         return (guider,)
