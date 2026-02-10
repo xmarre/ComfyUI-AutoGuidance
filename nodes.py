@@ -53,7 +53,11 @@ def _clone_model_options_for_bad(model_options: Dict[str, Any]) -> Dict[str, Any
     return bad_opts
 
 
-def _activate_patcher_for_forward(patcher: comfy.model_patcher.ModelPatcher) -> None:
+def _activate_patcher_for_forward(
+    patcher: comfy.model_patcher.ModelPatcher,
+    *,
+    peer_patchers: tuple[comfy.model_patcher.ModelPatcher, ...] = (),
+) -> None:
     m = getattr(patcher, "model", None)
     if m is None:
         return
@@ -65,14 +69,21 @@ def _activate_patcher_for_forward(patcher: comfy.model_patcher.ModelPatcher) -> 
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
 
+    # If current_patcher is missing/stale, derive owner from the active UUID.
+    if cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid:
+        for peer in peer_patchers:
+            if getattr(peer, "patches_uuid", None) == cur_uuid:
+                cur_owner = peer
+                break
+
     def _safe_unpatch(owner) -> None:
         if owner is None:
             return
         # Keep model on a concrete device while removing weight deltas.
         device = (
             getattr(m, "device", None)
-            or getattr(owner, "load_device", None)
             or getattr(patcher, "load_device", None)
+            or getattr(owner, "load_device", None)
         )
         try:
             if device is not None:
@@ -90,38 +101,29 @@ def _activate_patcher_for_forward(patcher: comfy.model_patcher.ModelPatcher) -> 
         m.current_weight_patches_uuid = None
 
     def _safe_patch() -> None:
-        # Prefer "no base reload" patching, forced if supported.
-        try:
-            patcher.patch_model(load_weights=False, force_patch_weights=True)
-            return
-        except TypeError:
-            pass
-
-        try:
-            patcher.patch_model(load_weights=False)
-            return
-        except TypeError:
-            pass
-
+        # Correctness-first for LoRA stacks on shared models.
         device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
         try:
-            patcher.patch_model(
-                device_to=device,
-                lowvram_model_memory=0,
-                load_weights=False,
-                force_patch_weights=True,
-            )
-        except TypeError as e:
-            raise RuntimeError(
-                "Unsupported ComfyUI patch_model signature: requires load_weights=False support for safe shared-model swaps."
-            ) from e
+            patcher.patch_model(device_to=device, lowvram_model_memory=0, load_weights=True, force_patch_weights=True)
+            return
+        except TypeError:
+            pass
+        try:
+            patcher.patch_model(device_to=device, lowvram_model_memory=0, load_weights=True)
+            return
+        except TypeError:
+            pass
+        try:
+            patcher.patch_model(load_weights=True)
+            return
+        except TypeError:
+            # absolute last resort
+            patcher.patch_model()
 
-    # If someone else owns the model, remove their weight deltas first.
-    if cur_owner is not None and cur_owner is not patcher:
-        owner_uuid = getattr(cur_owner, "patches_uuid", None)
-        if owner_uuid != want_uuid:
-            _safe_unpatch(cur_owner)
-            cur_uuid = getattr(m, "current_weight_patches_uuid", None)
+    # If current uuid is not what we want, remove the current owner's deltas first.
+    if cur_uuid is not None and cur_uuid != want_uuid and cur_owner is not None and cur_owner is not patcher:
+        _safe_unpatch(cur_owner)
+        cur_uuid = getattr(m, "current_weight_patches_uuid", None)
 
     # Apply desired patch set if needed.
     if want_uuid != cur_uuid or cur_owner is not patcher:
@@ -499,7 +501,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher)
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                if shared_model and not hasattr(self, "_ag_uuid_check_good_once"):
+                    m = getattr(self.model_patcher, "model", None)
+                    print("[AutoGuidance] after_good_activate current_uuid=", getattr(m, "current_weight_patches_uuid", None))
+                    self._ag_uuid_check_good_once = True
                 # Keep hooks/wrappers that consult current_patcher aligned.
                 self.inner_model.current_patcher = self.model_patcher
                 return comfy.samplers.calc_cond_batch(
@@ -514,7 +520,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_pre_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher)
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "conds": conds_good,
@@ -543,7 +549,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             if "sampler_cfg_function" in model_options:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher)
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "cond": x - cond_pred,
@@ -578,7 +584,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_bad(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.bad_model_patcher)
+                    _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,))
+                if shared_model and not hasattr(self, "_ag_uuid_check_bad_once"):
+                    m = getattr(self.bad_model_patcher, "model", None)
+                    print("[AutoGuidance] after_bad_activate current_uuid=", getattr(m, "current_weight_patches_uuid", None))
+                    self._ag_uuid_check_bad_once = True
                 self.inner_bad_model.current_patcher = self.bad_model_patcher
                 return comfy.samplers.calc_cond_batch(
                     self.inner_bad_model,
@@ -626,7 +636,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 out_bad_hooks = [bad_cond_pred, bad_cond_pred]
                 for fn in model_options.get("sampler_pre_cfg_function", []):
                     if shared_model:
-                        _activate_patcher_for_forward(self.bad_model_patcher)
+                        _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,))
                     self.inner_bad_model.current_patcher = self.bad_model_patcher
                     out_bad_hooks = fn(
                         {
@@ -651,7 +661,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_post_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher)
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "denoised": denoised,
@@ -671,12 +681,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 denoised = fn(args)
 
             if shared_model:
-                _activate_patcher_for_forward(self.model_patcher)
+                _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
             return denoised
         finally:
             try:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher)
+                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
             except Exception:
                 pass
             if self.inner_bad_model is not None:
