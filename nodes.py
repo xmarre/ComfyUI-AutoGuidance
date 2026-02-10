@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import inspect
+import os
 from collections.abc import Mapping
 from typing import Any, Dict, List
 
@@ -79,7 +81,7 @@ def _activate_patcher_for_forward(
         if resolved is not None:
             cur_owner = resolved
 
-    # Fast path: desired deltas are already applied (owner may be stale).
+    # Fast no-op: already correct, don't touch patching.
     if cur_uuid == want_uuid:
         m.current_patcher = patcher
         return
@@ -117,28 +119,92 @@ def _activate_patcher_for_forward(
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
 
-    try:
-        patcher.patch_model(
-            device_to=device,
-            lowvram_model_memory=0,
-            load_weights=True,
-            force_patch_weights=True,
-        )
-    except TypeError:
-        try:
-            patcher.patch_model(
-                device_to=device,
-                lowvram_model_memory=0,
-                load_weights=True,
-            )
-        except TypeError:
-            try:
-                patcher.patch_model(load_weights=True)
-            except TypeError:
-                patcher.patch_model()
+    # If after unpatch we're already correct (rare but possible), bail.
+    if cur_uuid == want_uuid:
+        m.current_patcher = patcher
+        return
+
+    _call_patch_model_safe(patcher, device=device)
 
     m.current_patcher = patcher
     m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+
+
+def _sig_accepts_kw(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return True
+
+    if name in sig.parameters:
+        return True
+
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+
+def _call_patch_model_safe(patcher, *, device):
+    """
+    Prefer load_weights=False (fast, no reload) if supported.
+    Fall back to load_weights=True only if needed.
+    Works across ComfyUI signature variants.
+    """
+    fn = patcher.patch_model
+
+    def _is_sig_typeerror(e: TypeError) -> bool:
+        msg = str(e)
+        return (
+            "unexpected keyword argument" in msg
+            or "got an unexpected keyword argument" in msg
+            or "positional argument" in msg
+            or "required positional argument" in msg
+            or ("takes" in msg and "positional" in msg)
+        )
+
+    def _try(load_weights: bool, force: bool, *, minimal: bool) -> bool:
+        kw = {}
+
+        # For the fast path, avoid device management args (they often trigger reload logic).
+        if not minimal:
+            if device is not None and _sig_accepts_kw(fn, "device_to"):
+                kw["device_to"] = device
+            if _sig_accepts_kw(fn, "lowvram_model_memory"):
+                kw["lowvram_model_memory"] = 0
+
+        if _sig_accepts_kw(fn, "load_weights"):
+            kw["load_weights"] = load_weights
+        if force and _sig_accepts_kw(fn, "force_patch_weights"):
+            kw["force_patch_weights"] = True
+        try:
+            fn(**kw)
+            return True
+        except TypeError as e:
+            if _is_sig_typeerror(e):
+                return False
+            raise
+
+    # Optional fast path toggle for validation/rollback.
+    # Any value other than "0" leaves fast patch swap attempts enabled.
+    fast_patch_swap = os.environ.get("AG_FAST_PATCH_SWAP", "1") != "0"
+
+    # FAST: minimal kwargs first (no device_to / no lowvram args)
+    if fast_patch_swap and _try(load_weights=False, force=True, minimal=True):
+        return
+    if fast_patch_swap and _try(load_weights=False, force=False, minimal=True):
+        return
+
+    # FAST fallback: if minimal didn't work, try with device args (still load_weights=False)
+    if fast_patch_swap and _try(load_weights=False, force=True, minimal=False):
+        return
+    if fast_patch_swap and _try(load_weights=False, force=False, minimal=False):
+        return
+
+    # SLOW correctness fallbacks
+    if _try(load_weights=True, force=True, minimal=False):
+        return
+    if _try(load_weights=True, force=False, minimal=False):
+        return
+
+    fn()
 
 
 def _find_first_y(cond: Any):
