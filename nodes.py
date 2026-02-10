@@ -65,6 +65,18 @@ AG_SWAP_MODE_CHOICES = [
     AG_SWAP_MODE_DUAL_MODELS,
 ]
 
+AG_DELTA_MODE_RAW = "raw_delta"
+AG_DELTA_MODE_PROJECT_CFG = "project_cfg"
+
+AG_DELTA_MODE_CHOICES = [
+    AG_DELTA_MODE_RAW,
+    AG_DELTA_MODE_PROJECT_CFG,
+]
+
+# Default cap for AG magnitude relative to CFG-direction magnitude.
+# Old code used 0.10 which is often visually near-invisible.
+AG_DEFAULT_MAX_RATIO = 0.35
+
 
 def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
     """
@@ -544,13 +556,25 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     (same convention used by other custom guiders that subclass CFGGuider).
     """
 
-    def __init__(self, good_model, bad_model, *, swap_mode: str = AG_SWAP_MODE_SHARED_SAFE):
+    def __init__(
+        self,
+        good_model,
+        bad_model,
+        *,
+        swap_mode: str = AG_SWAP_MODE_SHARED_SAFE,
+        ag_delta_mode: str = AG_DELTA_MODE_RAW,
+        ag_max_ratio: float = AG_DEFAULT_MAX_RATIO,
+        ag_allow_negative: bool = True,
+    ):
         super().__init__(good_model)
         self.bad_model_patcher = bad_model
         self.inner_bad_model = None
         self.bad_conds = None
         self.w_ag: float = 1.0  # paper-style weight; (w_ag - 1) is the delta scale
         self.swap_mode: str = str(swap_mode)
+        self.ag_delta_mode: str = str(ag_delta_mode)
+        self.ag_max_ratio: float = float(ag_max_ratio)
+        self.ag_allow_negative: bool = bool(ag_allow_negative)
 
     def set_conds(self, positive, negative) -> None:
         # Keep the same conditioning dict style used by CFGGuider-based guiders.
@@ -960,7 +984,31 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             bad_cond_pred = out_bad[0]
             bad_uncond_pred = out_bad[1]
 
-            bad_cfg_out = bad_uncond_pred + (bad_cond_pred - bad_uncond_pred) * self.cfg
+            # Keep bad CFG computation consistent with the good path.
+            # Some workflows install a sampler_cfg_function (e.g. cfg-rescale, custom thresholding).
+            if "sampler_cfg_function" in model_options:
+                if shared_model:
+                    _activate_patcher_for_forward(
+                        self.bad_model_patcher,
+                        peer_patchers=(self.model_patcher,),
+                        fast_weight_swap=fast_swap,
+                    )
+                self.inner_bad_model.current_patcher = self.bad_model_patcher
+                args_bad = {
+                    "cond": x - bad_cond_pred,
+                    "uncond": x - bad_uncond_pred,
+                    "cond_scale": self.cfg,
+                    "timestep": timestep,
+                    "input": x,
+                    "sigma": timestep,
+                    "cond_denoised": bad_cond_pred,
+                    "uncond_denoised": bad_uncond_pred,
+                    "model": self.inner_bad_model,
+                    "model_options": bad_model_options,
+                }
+                bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
+            else:
+                bad_cfg_out = bad_uncond_pred + (bad_cond_pred - bad_uncond_pred) * self.cfg
 
             # Leave both models in a known patcher state to reduce cross-talk across wrappers/cached objects.
             self.inner_bad_model.current_patcher = self.bad_model_patcher
@@ -968,23 +1016,51 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             d_cfg = cond_pred_good - uncond_pred_good
             d_ag = cfg_out - bad_cfg_out
-
-            cfg_denom = (d_cfg.float() * d_cfg.float()).sum() + 1e-8
-            alpha = (d_ag.float() * d_cfg.float()).sum() / cfg_denom
-            alpha = torch.clamp(alpha, min=0.0)
-            d_ag_proj = d_cfg * alpha.to(d_cfg.dtype)
-
             w = max(float(self.w_ag - 1.0), 0.0)
+            if w <= 0.0:
+                denoised = cfg_out
+            else:
+                mode = getattr(self, "ag_delta_mode", AG_DELTA_MODE_RAW)
+                allow_neg = bool(getattr(self, "ag_allow_negative", True))
 
-            max_ratio = 0.10
-            n_cfg = d_cfg.float().pow(2).sum().sqrt() + 1e-8
-            n_ag = d_ag_proj.float().pow(2).sum().sqrt() + 1e-8
+                # Choose AG direction.
+                if mode == AG_DELTA_MODE_PROJECT_CFG:
+                    cfg_denom = (d_cfg.float() * d_cfg.float()).sum() + 1e-8
+                    alpha = (d_ag.float() * d_cfg.float()).sum() / cfg_denom
+                    if not allow_neg:
+                        alpha = torch.clamp(alpha, min=0.0)
+                    d_ag_dir = d_cfg * alpha.to(d_cfg.dtype)
+                else:
+                    # Default: keep full delta between good- and bad-guided outputs.
+                    d_ag_dir = d_ag
 
-            eff_ratio = max_ratio / max(w, 1e-6)
-            scale = torch.clamp((eff_ratio * n_cfg) / n_ag, max=1.0)
+                ag_delta = w * d_ag_dir
 
-            ag_delta = w * (d_ag_proj * scale.to(d_ag_proj.dtype))
-            denoised = cfg_out + ag_delta
+                # Cap magnitude relative to CFG-direction magnitude.
+                max_ratio = float(getattr(self, "ag_max_ratio", AG_DEFAULT_MAX_RATIO))
+                if max_ratio > 0.0:
+                    n_cfg = d_cfg.float().pow(2).sum().sqrt() + 1e-8
+                    n_delta = ag_delta.float().pow(2).sum().sqrt() + 1e-8
+                    limit = max_ratio * n_cfg
+                    scale = torch.clamp(limit / n_delta, max=1.0)
+                    ag_delta = ag_delta * scale.to(ag_delta.dtype)
+
+                    if os.environ.get("AG_DEBUG_METRICS", "0") == "1" and not hasattr(self, "_ag_dbg_metrics_once"):
+                        print(
+                            "[AutoGuidance] metrics",
+                            {
+                                "mode": mode,
+                                "w_ag": float(self.w_ag),
+                                "w": float(w),
+                                "ag_max_ratio": float(max_ratio),
+                                "n_cfg": float(n_cfg.detach().cpu()),
+                                "n_delta": float(n_delta.detach().cpu()),
+                                "scale": float(scale.detach().cpu()),
+                            },
+                        )
+                        self._ag_dbg_metrics_once = True
+
+                denoised = cfg_out + ag_delta
 
             for fn in model_options.get("sampler_post_cfg_function", []):
                 if shared_model:
@@ -1045,6 +1121,16 @@ class AutoGuidanceCFGGuider:
                 # - shared_fast_extra_vram: faster shared-model swapping, costs extra VRAM
                 # - dual_models_2x_vram: fastest, but requires truly distinct model instances (~2x VRAM)
                 "swap_mode": (AG_SWAP_MODE_CHOICES, {"default": AG_SWAP_MODE_SHARED_SAFE}),
+            },
+            "optional": {
+                # If AG looks too subtle, increase ag_max_ratio first (0.35 -> 0.75).
+                "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_RAW}),
+                "ag_max_ratio": (
+                    "FLOAT",
+                    {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01},
+                ),
+                # Only affects project_cfg mode; when False, opposite-direction AG becomes 0.
+                "ag_allow_negative": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -1052,8 +1138,27 @@ class AutoGuidanceCFGGuider:
     FUNCTION = "get_guider"
     CATEGORY = "sampling/guiders"
 
-    def get_guider(self, good_model, bad_model, positive, negative, cfg: float, w_autoguide: float, swap_mode=AG_SWAP_MODE_SHARED_SAFE):
-        guider = Guider_AutoGuidanceCFG(good_model, bad_model, swap_mode=swap_mode)
+    def get_guider(
+        self,
+        good_model,
+        bad_model,
+        positive,
+        negative,
+        cfg: float,
+        w_autoguide: float,
+        swap_mode=AG_SWAP_MODE_SHARED_SAFE,
+        ag_delta_mode=AG_DELTA_MODE_RAW,
+        ag_max_ratio=AG_DEFAULT_MAX_RATIO,
+        ag_allow_negative=True,
+    ):
+        guider = Guider_AutoGuidanceCFG(
+            good_model,
+            bad_model,
+            swap_mode=swap_mode,
+            ag_delta_mode=ag_delta_mode,
+            ag_max_ratio=ag_max_ratio,
+            ag_allow_negative=ag_allow_negative,
+        )
         guider.set_conds(positive, negative)
         guider.set_scales(cfg=cfg, w_ag=w_autoguide)
         return (guider,)
