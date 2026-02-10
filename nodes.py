@@ -67,6 +67,7 @@ def _activate_patcher_for_forward(
     if not hasattr(m, "current_weight_patches_uuid"):
         m.current_weight_patches_uuid = None
 
+    uuid_only_noop = os.environ.get("AG_UUID_ONLY_NOOP", "0") == "1"
     want_uuid = getattr(patcher, "patches_uuid", None)
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
@@ -81,8 +82,11 @@ def _activate_patcher_for_forward(
         if resolved is not None:
             cur_owner = resolved
 
-    # Fast no-op: already correct, don't touch patching.
-    if cur_uuid == want_uuid:
+    # Fast no-op ONLY when Comfy's *real* current_patcher already matches.
+    # current_weight_patches_uuid can be stale across prompts/runs; relying on UUID alone
+    # can skip required LoRA weight deltas and causes "washed out" output.
+    real_owner = getattr(m, "current_patcher", None)
+    if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
         return
 
@@ -119,8 +123,9 @@ def _activate_patcher_for_forward(
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
 
-    # If after unpatch we're already correct (rare but possible), bail.
-    if cur_uuid == want_uuid:
+    # Same rule here: only no-op if the real owner matches (unless explicitly opted in).
+    real_owner = getattr(m, "current_patcher", None)
+    if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
         return
 
@@ -157,6 +162,13 @@ def _call_patch_model_safe(patcher, *, device):
             or "got an unexpected keyword argument" in msg
             or "positional argument" in msg
             or "required positional argument" in msg
+            # Python keyword-only mismatch variants
+            or "missing a required keyword-only argument" in msg
+            or "missing required keyword-only argument" in msg
+            or "required keyword-only argument" in msg
+            # Also a common signature mismatch form
+            or "got multiple values for argument" in msg
+            or "multiple values for keyword argument" in msg
             or ("takes" in msg and "positional" in msg)
         )
 
@@ -183,19 +195,21 @@ def _call_patch_model_safe(patcher, *, device):
             raise
 
     # Optional fast path toggle for validation/rollback.
-    # Any value other than "0" leaves fast patch swap attempts enabled.
-    fast_patch_swap = os.environ.get("AG_FAST_PATCH_SWAP", "1") != "0"
+    # Make fast swapping opt-in so default behavior never regresses correctness.
+    # Set AG_FAST_PATCH_SWAP=1 to enable load_weights=False attempts.
+    fast_patch_swap = os.environ.get("AG_FAST_PATCH_SWAP", "0") == "1"
 
-    # FAST: minimal kwargs first (no device_to / no lowvram args)
-    if fast_patch_swap and _try(load_weights=False, force=True, minimal=True):
-        return
-    if fast_patch_swap and _try(load_weights=False, force=False, minimal=True):
-        return
-
-    # FAST fallback: if minimal didn't work, try with device args (still load_weights=False)
+    # FAST: try with device args first (still load_weights=False) — much less likely
+    # to "succeed but not actually patch".
     if fast_patch_swap and _try(load_weights=False, force=True, minimal=False):
         return
     if fast_patch_swap and _try(load_weights=False, force=False, minimal=False):
+        return
+
+    # FAST fallback: minimal kwargs (no device args)
+    if fast_patch_swap and _try(load_weights=False, force=True, minimal=True):
+        return
+    if fast_patch_swap and _try(load_weights=False, force=False, minimal=True):
         return
 
     # SLOW correctness fallbacks
