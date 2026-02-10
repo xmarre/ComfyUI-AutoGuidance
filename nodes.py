@@ -364,154 +364,173 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         if model_options.get("transformer_options", None) is None:
             model_options["transformer_options"] = {}
 
-        positive_cond = self.conds.get("positive", None)
-        negative_cond = self.conds.get("negative", None)
-
-        # SDXL needs the extra y/adm inputs; do not use None-uncond optimization.
-        uncond_for_good = negative_cond
-
-        conds_good: List[Any] = [positive_cond, uncond_for_good]
-        self.inner_model.current_patcher = self.model_patcher
-        out_good = comfy.samplers.calc_cond_batch(
-            self.inner_model,
-            conds_good,
-            x,
-            timestep,
-            model_options,
-        )
-
-        for fn in model_options.get("sampler_pre_cfg_function", []):
-            args = {
-                "conds": conds_good,
-                "conds_out": out_good,
-                "cond_scale": self.cfg,
-                "timestep": timestep,
-                "input": x,
-                "sigma": timestep,
-                "model": self.inner_model,
-                "model_options": model_options,
-            }
-            out_good = fn(args)
-
-        cond_pred = out_good[0]
-        uncond_pred = out_good[1]
-
-        if "sampler_cfg_function" in model_options:
-            args = {
-                "cond": x - cond_pred,
-                "uncond": x - uncond_pred,
-                "cond_scale": self.cfg,
-                "timestep": timestep,
-                "input": x,
-                "sigma": timestep,
-                "cond_denoised": cond_pred,
-                "uncond_denoised": uncond_pred,
-                "model": self.inner_model,
-                "model_options": model_options,
-            }
-            cfg_out = x - model_options["sampler_cfg_function"](args)
-        else:
-            cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
-
-        # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
-        pos_bad_cond = self.bad_conds["positive"] if self.bad_conds and "positive" in self.bad_conds else positive_cond
-        pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
-
-        pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
-        pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
-        if self.bad_conds is not None:
-            self.bad_conds["positive"] = pos_bad_cond
-
-        # IMPORTANT: Some SDXL-style class-conditional models require "y".
-        # Passing `None` as a second conditioning can drop those and trip
-        # "must specify y if and only if the model is class-conditional".
-        # So: run ONLY a single conditional forward for the bad model.
-        conds_bad_single: List[Any] = [pos_bad_cond]
-        self.inner_bad_model.current_patcher = self.bad_model_patcher
-
-        def _run_bad(conds_list: List[Any]) -> List[Any]:
-            return comfy.samplers.calc_cond_batch(
-                self.inner_bad_model,
-                conds_list,
-                x,
-                timestep,
-                model_options,
-            )
-
         try:
-            out_bad_single = _run_bad(conds_bad_single)
-        except AssertionError as e:
-            if "must specify y if and only if the model is class-conditional" not in str(e):
-                raise
+            positive_cond = self.conds.get("positive", None)
+            negative_cond = self.conds.get("negative", None)
+
+            # SDXL needs the extra y/adm inputs; do not use None-uncond optimization.
+            uncond_for_good = negative_cond
+
+            conds_good: List[Any] = [positive_cond, uncond_for_good]
+
+            def _run_good(conds_list: List[Any]) -> List[Any]:
+                # IMPORTANT: Comfy model objects keep current_patcher state.
+                # Force the "good" forward to use the good patcher (and LoRA stack).
+                self.inner_model.current_patcher = self.model_patcher
+                return comfy.samplers.calc_cond_batch(
+                    self.inner_model,
+                    conds_list,
+                    x,
+                    timestep,
+                    model_options,
+                )
+
+            out_good = _run_good(conds_good)
+
+            for fn in model_options.get("sampler_pre_cfg_function", []):
+                self.inner_model.current_patcher = self.model_patcher
+                args = {
+                    "conds": conds_good,
+                    "conds_out": out_good,
+                    "cond_scale": self.cfg,
+                    "timestep": timestep,
+                    "input": x,
+                    "sigma": timestep,
+                    "model": self.inner_model,
+                    "model_options": model_options,
+                }
+                out_good = fn(args)
+
+            cond_pred = out_good[0]
+            uncond_pred = out_good[1]
+
+            if "sampler_cfg_function" in model_options:
+                self.inner_model.current_patcher = self.model_patcher
+                args = {
+                    "cond": x - cond_pred,
+                    "uncond": x - uncond_pred,
+                    "cond_scale": self.cfg,
+                    "timestep": timestep,
+                    "input": x,
+                    "sigma": timestep,
+                    "cond_denoised": cond_pred,
+                    "uncond_denoised": uncond_pred,
+                    "model": self.inner_model,
+                    "model_options": model_options,
+                }
+                cfg_out = x - model_options["sampler_cfg_function"](args)
+            else:
+                cfg_out = uncond_pred + (cond_pred - uncond_pred) * self.cfg
+
+            # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
+            pos_bad_cond = self.bad_conds["positive"] if self.bad_conds and "positive" in self.bad_conds else positive_cond
             pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
+
             pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
             pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
             if self.bad_conds is not None:
                 self.bad_conds["positive"] = pos_bad_cond
-            conds_bad_single = [pos_bad_cond]
+
+            # IMPORTANT: Some SDXL-style class-conditional models require "y".
+            # Passing `None` as a second conditioning can drop those and trip
+            # "must specify y if and only if the model is class-conditional".
+            # So: run ONLY a single conditional forward for the bad model.
+            conds_bad_single: List[Any] = [pos_bad_cond]
+
+            def _run_bad(conds_list: List[Any]) -> List[Any]:
+                self.inner_bad_model.current_patcher = self.bad_model_patcher
+                return comfy.samplers.calc_cond_batch(
+                    self.inner_bad_model,
+                    conds_list,
+                    x,
+                    timestep,
+                    model_options,
+                )
+
             try:
                 out_bad_single = _run_bad(conds_bad_single)
-            except RuntimeError as e2:
-                if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
+            except AssertionError as e:
+                if "must specify y if and only if the model is class-conditional" not in str(e):
+                    raise
+                pos_bad_cond = _clone_cond_metadata(pos_bad_cond)
+                pos_bad_cond = _restore_y_per_entry(pos_bad_cond, positive_cond, negative_cond)
+                pos_bad_cond = _ensure_primary_text_cond(pos_bad_cond, positive_cond)
+                if self.bad_conds is not None:
+                    self.bad_conds["positive"] = pos_bad_cond
+                conds_bad_single = [pos_bad_cond]
+                try:
+                    out_bad_single = _run_bad(conds_bad_single)
+                except RuntimeError as e2:
+                    if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
+                        raise
+                    pos_bad_cond = _clone_cond_metadata(positive_cond)
+                    if self.bad_conds is not None:
+                        self.bad_conds["positive"] = pos_bad_cond
+                    conds_bad_single = [pos_bad_cond]
+                    out_bad_single = _run_bad(conds_bad_single)
+            except RuntimeError as e:
+                if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
                     raise
                 pos_bad_cond = _clone_cond_metadata(positive_cond)
                 if self.bad_conds is not None:
                     self.bad_conds["positive"] = pos_bad_cond
                 conds_bad_single = [pos_bad_cond]
                 out_bad_single = _run_bad(conds_bad_single)
-        except RuntimeError as e:
-            if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
-                raise
-            pos_bad_cond = _clone_cond_metadata(positive_cond)
-            if self.bad_conds is not None:
-                self.bad_conds["positive"] = pos_bad_cond
-            conds_bad_single = [pos_bad_cond]
-            out_bad_single = _run_bad(conds_bad_single)
-        bad_cond_pred = out_bad_single[0]
+            bad_cond_pred = out_bad_single[0]
 
-        # If any pre-cfg hooks exist, provide a 2-slot "view" (duplicate) for compatibility
-        # without doing a second forward pass.
-        if model_options.get("sampler_pre_cfg_function", []):
+            # If any pre-cfg hooks exist, provide a 2-slot "view" (duplicate) for compatibility
+            # without doing a second forward pass.
+            if model_options.get("sampler_pre_cfg_function", []):
+                conds_bad_hooks: List[Any] = [pos_bad_cond, pos_bad_cond]
+                out_bad_hooks = [bad_cond_pred, bad_cond_pred]
+                for fn in model_options.get("sampler_pre_cfg_function", []):
+                    self.inner_bad_model.current_patcher = self.bad_model_patcher
+                    out_bad_hooks = fn(
+                        {
+                            "conds": conds_bad_hooks,
+                            "conds_out": out_bad_hooks,
+                            "cond_scale": self.cfg,
+                            "timestep": timestep,
+                            "input": x,
+                            "sigma": timestep,
+                            "model": self.inner_bad_model,
+                            "model_options": model_options,
+                        }
+                    )
+                bad_cond_pred = out_bad_hooks[0]
+
+            # Leave both models in a known patcher state to reduce cross-talk across wrappers/cached objects.
             self.inner_bad_model.current_patcher = self.bad_model_patcher
-            conds_bad_hooks: List[Any] = [pos_bad_cond, pos_bad_cond]
-            out_bad_hooks = [bad_cond_pred, bad_cond_pred]
-            for fn in model_options.get("sampler_pre_cfg_function", []):
-                out_bad_hooks = fn(
-                    {
-                        "conds": conds_bad_hooks,
-                        "conds_out": out_bad_hooks,
-                        "cond_scale": self.cfg,
-                        "timestep": timestep,
-                        "input": x,
-                        "sigma": timestep,
-                        "model": self.inner_bad_model,
-                        "model_options": model_options,
-                    }
-                )
-            bad_cond_pred = out_bad_hooks[0]
+            self.inner_model.current_patcher = self.model_patcher
 
-        ag_delta = (self.w_ag - 1.0) * (cond_pred - bad_cond_pred)
-        denoised = cfg_out + ag_delta
+            ag_delta = (self.w_ag - 1.0) * (cond_pred - bad_cond_pred)
+            denoised = cfg_out + ag_delta
 
-        for fn in model_options.get("sampler_post_cfg_function", []):
-            args = {
-                "denoised": denoised,
-                "cond": positive_cond,
-                "uncond": uncond_for_good,
-                "model": self.inner_model,
-                "uncond_denoised": uncond_pred,
-                "cond_denoised": cond_pred,
-                "sigma": timestep,
-                "model_options": model_options,
-                "input": x,
-                "cond_scale": self.cfg,
-                "bad_model": self.inner_bad_model,
-                "bad_cond_denoised": bad_cond_pred,
-                "autoguidance_w": self.w_ag,
-            }
-            denoised = fn(args)
+            for fn in model_options.get("sampler_post_cfg_function", []):
+                self.inner_model.current_patcher = self.model_patcher
+                args = {
+                    "denoised": denoised,
+                    "cond": positive_cond,
+                    "uncond": uncond_for_good,
+                    "model": self.inner_model,
+                    "uncond_denoised": uncond_pred,
+                    "cond_denoised": cond_pred,
+                    "sigma": timestep,
+                    "model_options": model_options,
+                    "input": x,
+                    "cond_scale": self.cfg,
+                    "bad_model": self.inner_bad_model,
+                    "bad_cond_denoised": bad_cond_pred,
+                    "autoguidance_w": self.w_ag,
+                }
+                denoised = fn(args)
 
-        return denoised
+            return denoised
+        finally:
+            if self.inner_bad_model is not None:
+                self.inner_bad_model.current_patcher = self.bad_model_patcher
+            if self.inner_model is not None:
+                self.inner_model.current_patcher = self.model_patcher
 
 
 class AutoGuidanceCFGGuider:
