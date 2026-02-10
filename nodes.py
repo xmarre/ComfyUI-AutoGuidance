@@ -65,75 +65,57 @@ def _activate_patcher_for_forward(
     if not hasattr(m, "current_weight_patches_uuid"):
         m.current_weight_patches_uuid = None
 
-    want_uuid = getattr(patcher, "patches_uuid", None)
-    cur_uuid = getattr(m, "current_weight_patches_uuid", None)
-    cur_owner = getattr(m, "current_patcher", None)
+    device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
 
-    # If current_patcher is missing/stale, derive owner from the active UUID.
-    if cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid:
-        for peer in peer_patchers:
-            if getattr(peer, "patches_uuid", None) == cur_uuid:
-                cur_owner = peer
-                break
-
-    def _safe_unpatch(owner) -> None:
-        if owner is None:
+    def _unpatch(p) -> None:
+        if p is None:
             return
-        # Keep model on a concrete device while removing weight deltas.
-        device = (
-            getattr(m, "device", None)
-            or getattr(patcher, "load_device", None)
-            or getattr(owner, "load_device", None)
-        )
         try:
             if device is not None:
-                owner.unpatch_model(device_to=device, unpatch_weights=True)
+                p.unpatch_model(device_to=device, unpatch_weights=True)
             else:
-                owner.unpatch_model(unpatch_weights=True)
+                p.unpatch_model(unpatch_weights=True)
         except TypeError:
             try:
                 if device is not None:
-                    owner.unpatch_model(device, True)
+                    p.unpatch_model(device, True)
                 else:
-                    owner.unpatch_model()
+                    p.unpatch_model()
             except Exception:
-                owner.unpatch_model()
+                p.unpatch_model()
+
+        if getattr(m, "current_patcher", None) is p:
+            m.current_patcher = None
         m.current_weight_patches_uuid = None
 
-    def _safe_patch() -> None:
-        # Correctness-first for LoRA stacks on shared models.
-        device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
-        try:
-            patcher.patch_model(device_to=device, lowvram_model_memory=0, load_weights=True, force_patch_weights=True)
-            return
-        except TypeError:
-            pass
-        try:
-            patcher.patch_model(device_to=device, lowvram_model_memory=0, load_weights=True)
-            return
-        except TypeError:
-            pass
-        try:
-            patcher.patch_model(load_weights=True)
-            return
-        except TypeError:
-            # absolute last resort
-            patcher.patch_model()
+    # Shared-model safety: clear all known deltas, then apply exactly the desired patcher.
+    for peer in peer_patchers:
+        _unpatch(peer)
+    _unpatch(patcher)
 
-    # If current uuid is not what we want, remove the current owner's deltas first.
-    if cur_uuid is not None and cur_uuid != want_uuid and cur_owner is not None and cur_owner is not patcher:
-        _safe_unpatch(cur_owner)
-        cur_uuid = getattr(m, "current_weight_patches_uuid", None)
-
-    # Apply desired patch set if needed.
-    if want_uuid != cur_uuid or cur_owner is not patcher:
-        # If we're "owner" but uuid differs, clear our own deltas first.
-        if cur_owner is patcher and cur_uuid != want_uuid:
-            _safe_unpatch(patcher)
-        _safe_patch()
-        m.current_weight_patches_uuid = want_uuid
+    try:
+        patcher.patch_model(
+            device_to=device,
+            lowvram_model_memory=0,
+            load_weights=False,
+            force_patch_weights=True,
+        )
+    except TypeError:
+        try:
+            patcher.patch_model(
+                device_to=device,
+                lowvram_model_memory=0,
+                load_weights=True,
+                force_patch_weights=True,
+            )
+        except TypeError:
+            try:
+                patcher.patch_model(load_weights=True)
+            except TypeError:
+                patcher.patch_model()
 
     m.current_patcher = patcher
+    m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
 
 
 def _find_first_y(cond: Any):
@@ -477,6 +459,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         bad_model_options = _clone_model_options_for_bad(model_options)
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
 
+        if shared_model:
+            _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+
         if not hasattr(self, "_ag_dbg_once"):
             try:
                 if shared_model:
@@ -502,6 +487,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
                     _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,))
+                    if not hasattr(self, "_ag_dbg_flip_good_once"):
+                        m = getattr(self.model_patcher, "model", None)
+                        print(
+                            "[AutoGuidance] good_active?",
+                            getattr(m, "current_weight_patches_uuid", None),
+                            "want",
+                            getattr(self.model_patcher, "patches_uuid", None),
+                        )
+                        self._ag_dbg_flip_good_once = True
                 if shared_model and not hasattr(self, "_ag_uuid_check_good_once"):
                     m = getattr(self.model_patcher, "model", None)
                     print("[AutoGuidance] after_good_activate current_uuid=", getattr(m, "current_weight_patches_uuid", None))
@@ -585,6 +579,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             def _run_bad(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
                     _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,))
+                    if not hasattr(self, "_ag_dbg_flip_bad_once"):
+                        m = getattr(self.bad_model_patcher, "model", None)
+                        print(
+                            "[AutoGuidance] bad_active?",
+                            getattr(m, "current_weight_patches_uuid", None),
+                            "want",
+                            getattr(self.bad_model_patcher, "patches_uuid", None),
+                        )
+                        self._ag_dbg_flip_bad_once = True
                 if shared_model and not hasattr(self, "_ag_uuid_check_bad_once"):
                     m = getattr(self.bad_model_patcher, "model", None)
                     print("[AutoGuidance] after_bad_activate current_uuid=", getattr(m, "current_weight_patches_uuid", None))
