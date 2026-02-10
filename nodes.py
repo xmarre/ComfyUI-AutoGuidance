@@ -65,33 +65,57 @@ def _activate_patcher_for_forward(
     if not hasattr(m, "current_weight_patches_uuid"):
         m.current_weight_patches_uuid = None
 
+    want_uuid = getattr(patcher, "patches_uuid", None)
+    cur_uuid = getattr(m, "current_weight_patches_uuid", None)
+    cur_owner = getattr(m, "current_patcher", None)
+
+    # Resolve owner robustly from UUID if current_patcher is stale/missing.
+    if cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid:
+        resolved = None
+        for p in (patcher, *peer_patchers):
+            if getattr(p, "patches_uuid", None) == cur_uuid:
+                resolved = p
+                break
+        if resolved is not None:
+            cur_owner = resolved
+
+    # Fast path: desired deltas are already applied (owner may be stale).
+    if cur_uuid == want_uuid:
+        m.current_patcher = patcher
+        return
+
     device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
 
-    def _unpatch(p) -> None:
-        if p is None:
+    def _unpatch_owner(owner) -> None:
+        if owner is None:
             return
         try:
             if device is not None:
-                p.unpatch_model(device_to=device, unpatch_weights=True)
+                owner.unpatch_model(device_to=device, unpatch_weights=True)
             else:
-                p.unpatch_model(unpatch_weights=True)
+                owner.unpatch_model(unpatch_weights=True)
         except TypeError:
             try:
                 if device is not None:
-                    p.unpatch_model(device, True)
+                    owner.unpatch_model(device, True)
                 else:
-                    p.unpatch_model()
+                    owner.unpatch_model()
             except Exception:
-                p.unpatch_model()
+                owner.unpatch_model()
 
-        if getattr(m, "current_patcher", None) is p:
-            m.current_patcher = None
         m.current_weight_patches_uuid = None
+        if getattr(m, "current_patcher", None) is owner:
+            m.current_patcher = None
 
-    # Shared-model safety: clear all known deltas, then apply exactly the desired patcher.
-    for peer in peer_patchers:
-        _unpatch(peer)
-    _unpatch(patcher)
+    # Only unpatch the current owner (never blanket-unpatch peers).
+    if cur_owner is not None and cur_owner is not patcher:
+        _unpatch_owner(cur_owner)
+    elif cur_owner is patcher and cur_uuid != want_uuid:
+        _unpatch_owner(patcher)
+
+    # Refresh state after unpatch before deciding whether to patch.
+    cur_uuid = getattr(m, "current_weight_patches_uuid", None)
+    cur_owner = getattr(m, "current_patcher", None)
 
     try:
         patcher.patch_model(
