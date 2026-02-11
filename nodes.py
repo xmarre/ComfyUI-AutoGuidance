@@ -15,6 +15,27 @@ import comfy.patcher_extension
 import comfy.hooks
 
 
+def _to_sigma_scalar(v) -> float | None:
+    """Return scalar sigma even if passed as a batch vector (shape [B])."""
+    if v is None:
+        return None
+    if torch.is_tensor(v):
+        t = v.detach()
+        if t.numel() == 0:
+            return None
+        t = t.reshape(-1)
+        if t.numel() == 1:
+            return float(t.item())
+        # Usually all batch sigmas are identical; if not, be conservative.
+        if not torch.allclose(t, t[0], rtol=1e-3, atol=1e-5):
+            return float(t.max().item())
+        return float(t[0].item())
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
 def _clone_cond_metadata(cond):
     """
     Clone only the conditioning metadata containers, not the tensors.
@@ -1186,13 +1207,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     ratio = max_ratio
                     sigma_max = getattr(self, "_ag_sigma_max", None)
                     if sigma_max is not None and sigma_max > 0:
-                        try:
-                            sigma_cur = float(timestep.item())
-                        except Exception:
-                            sigma_cur = float(timestep.detach().cpu().item())
-                        prog = 1.0 - (sigma_cur / sigma_max)  # 0 early -> 1 late
-                        prog = max(0.0, min(1.0, prog))
-                        ratio = max_ratio * (prog * prog)  # quadratic ramp
+                        sigma_cur = _to_sigma_scalar(timestep)
+                        if sigma_cur is not None:
+                            prog = 1.0 - (sigma_cur / sigma_max)  # 0 early -> 1 late
+                            prog = max(0.0, min(1.0, prog))
+                            ratio = max_ratio * (prog * prog)  # quadratic ramp
 
                     limit = ratio * n_cfg
                     scale = torch.clamp(limit / (n_delta + 1e-8), max=1.0)
