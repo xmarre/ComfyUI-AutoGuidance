@@ -1607,10 +1607,330 @@ class AutoGuidanceCFGGuider:
         return (guider,)
 
 
+# ==================== Impact Pack (FaceDetailer) integration ====================
+# Provides a DETAILER_HOOK that injects an AutoGuidance GUIDER into Impact Pack's sampling path,
+# without modifying Impact Pack files on disk (runtime monkeypatch).
+
+def _ag_try_patch_comfy_samplers_sample() -> bool:
+    """
+    Monkeypatch comfy.samplers.sample so that, when a MODEL patcher carries a temporary
+    attribute `_ag_detailer_guider`, sampling uses that GUIDER instead of CFGGuider(model).
+
+    This keeps Impact Pack and other extensions on the normal Comfy sampling path.
+    """
+    try:
+        import comfy.samplers as comfy_samplers  # type: ignore
+    except Exception:
+        return False
+
+    # If some other extension overwrote sample after we patched, re-patch.
+    cur = getattr(comfy_samplers, "sample", None)
+    if getattr(cur, "_ag_autoguidance_wrapper", False):
+        return True
+
+    orig_fn = getattr(comfy_samplers, "sample", None)
+    if orig_fn is None or not callable(orig_fn):
+        return False
+
+    def _call_guider_sample(guider, noise, latent_samples, sampler, sigmas, denoise_mask, cb, disable_pbar, seed, extra_kwargs=None):
+        # Prefer kwargs signature (newer/guider-style), then retry without extra kwargs,
+        # then fall back to positional signatures.
+        extra_kwargs = extra_kwargs or {}
+        try:
+            return guider.sample(
+                noise,
+                latent_samples,
+                sampler,
+                sigmas,
+                denoise_mask=denoise_mask,
+                callback=cb,
+                disable_pbar=disable_pbar,
+                seed=seed,
+                **extra_kwargs,
+            )
+        except TypeError:
+            pass
+        try:
+            return guider.sample(
+                noise,
+                latent_samples,
+                sampler,
+                sigmas,
+                denoise_mask=denoise_mask,
+                callback=cb,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
+        except TypeError:
+            return guider.sample(noise, latent_samples, sampler, sigmas, denoise_mask, cb, disable_pbar, seed)
+
+    def patched_sample(
+        model,
+        noise,
+        positive,
+        negative,
+        cfg,
+        device,
+        sampler,
+        sigmas,
+        model_options=None,
+        latent_image=None,
+        denoise_mask=None,
+        callback=None,
+        disable_pbar=False,
+        seed=None,
+        **kwargs,
+    ):
+        guider = getattr(model, "_ag_detailer_guider", None)
+        if guider is None or latent_image is None:
+            return orig_fn(
+                model,
+                noise,
+                positive,
+                negative,
+                cfg,
+                device,
+                sampler,
+                sigmas,
+                model_options if model_options is not None else {},
+                latent_image=latent_image,
+                denoise_mask=denoise_mask,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=seed,
+                **kwargs,
+            )
+
+        # One-shot: prevent leakage into later samplers.
+        try:
+            delattr(model, "_ag_detailer_guider")
+        except Exception:
+            pass
+
+        # Sync guider with final hook-modified params.
+        try:
+            if hasattr(guider, "set_conds"):
+                guider.set_conds(positive, negative)
+        except Exception:
+            pass
+
+        try:
+            # Our Guider_AutoGuidanceCFG has set_scales(cfg, w_ag)
+            if hasattr(guider, "set_scales"):
+                w = getattr(guider, "w_ag", None)
+                if w is None:
+                    w = getattr(guider, "w_autoguide", 2.0)
+                guider.set_scales(cfg=float(cfg), w_ag=float(w))
+            elif hasattr(guider, "set_cfg"):
+                guider.set_cfg(float(cfg))
+            else:
+                guider.cfg = float(cfg)
+        except Exception:
+            pass
+
+        # Prefer non-empty per-call model_options, otherwise fall back to ModelPatcher options.
+        try:
+            if isinstance(model_options, dict) and len(model_options) > 0:
+                guider.model_options = model_options
+            else:
+                guider.model_options = getattr(model, "model_options", guider.model_options)
+        except Exception:
+            pass
+
+        return _call_guider_sample(
+            guider,
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            seed,
+            extra_kwargs=kwargs,
+        )
+
+    comfy_samplers._ag_autoguidance_patched = True
+    comfy_samplers._ag_autoguidance_original_sample = orig_fn
+    comfy_samplers.sample = patched_sample
+    try:
+        setattr(comfy_samplers.sample, "_ag_autoguidance_wrapper", True)
+    except Exception:
+        pass
+    return True
+
+
+def _ag_try_import_impact_hook_base():
+    try:
+        from impact.hooks import DetailerHook  # type: ignore
+
+        return DetailerHook
+    except Exception:
+        return None
+
+
+class _AutoGuidanceImpactDetailerHookBase:
+    """Fallback base if Impact Pack isn't present at import time."""
+
+    pass
+
+
+_ImpactDetailerHook = _ag_try_import_impact_hook_base() or _AutoGuidanceImpactDetailerHookBase
+
+
+class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
+    """A DETAILER_HOOK for Impact Pack detailers (including FaceDetailer)."""
+
+    def __init__(
+        self,
+        bad_model,
+        *,
+        w_autoguide: float = 2.0,
+        swap_mode: str = AG_SWAP_MODE_SHARED_SAFE,
+        ag_delta_mode: str = AG_DELTA_MODE_BAD_CONDITIONAL,
+        ag_max_ratio: float = AG_DEFAULT_MAX_RATIO,
+        ag_allow_negative: bool = True,
+        ag_ramp_mode: str = AG_RAMP_FLAT,
+        ag_ramp_power: float = 2.0,
+        ag_ramp_floor: float = 0.15,
+        ag_post_cfg_mode: str = AG_POST_CFG_KEEP,
+        safe_force_clean_swap: bool = True,
+        uuid_only_noop: bool = False,
+        debug_swap: bool = False,
+        debug_metrics: bool = False,
+    ):
+        super().__init__()
+        self.bad_model = bad_model
+        self.w_autoguide = float(w_autoguide)
+        self.swap_mode = str(swap_mode)
+        self.ag_delta_mode = str(ag_delta_mode)
+        self.ag_max_ratio = float(ag_max_ratio)
+        self.ag_allow_negative = bool(ag_allow_negative)
+        self.ag_ramp_mode = str(ag_ramp_mode)
+        self.ag_ramp_power = float(ag_ramp_power)
+        self.ag_ramp_floor = float(ag_ramp_floor)
+        self.ag_post_cfg_mode = str(ag_post_cfg_mode)
+        self.safe_force_clean_swap = bool(safe_force_clean_swap)
+        self.uuid_only_noop = bool(uuid_only_noop)
+        self.debug_swap = bool(debug_swap)
+        self.debug_metrics = bool(debug_metrics)
+
+    def pre_ksample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise):
+        _ag_try_patch_comfy_samplers_sample()
+        try:
+            delattr(model, "_ag_detailer_guider")
+        except Exception:
+            pass
+
+        guider = Guider_AutoGuidanceCFG(
+            model,
+            self.bad_model,
+            swap_mode=self.swap_mode,
+            ag_delta_mode=self.ag_delta_mode,
+            ag_max_ratio=self.ag_max_ratio,
+            ag_allow_negative=self.ag_allow_negative,
+            ag_ramp_mode=self.ag_ramp_mode,
+            ag_ramp_power=self.ag_ramp_power,
+            ag_ramp_floor=self.ag_ramp_floor,
+            ag_post_cfg_mode=self.ag_post_cfg_mode,
+            safe_force_clean_swap=self.safe_force_clean_swap,
+            uuid_only_noop=self.uuid_only_noop,
+            debug_swap=self.debug_swap,
+            debug_metrics=self.debug_metrics,
+        )
+        try:
+            guider.set_conds(positive, negative)
+        except Exception:
+            pass
+        try:
+            guider.set_scales(cfg=float(cfg), w_ag=float(self.w_autoguide))
+        except Exception:
+            try:
+                guider.cfg = float(cfg)
+                guider.w_ag = float(self.w_autoguide)
+            except Exception:
+                pass
+
+        try:
+            setattr(model, "_ag_detailer_guider", guider)
+        except Exception:
+            pass
+
+        return model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise
+
+
+class AutoGuidanceImpactDetailerHookProvider:
+    """Node: creates a DETAILER_HOOK for Impact Pack FaceDetailer/Detailer nodes."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "bad_model": ("MODEL",),
+                "w_autoguide": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 5.0, "step": 0.05, "round": 0.01}),
+                "swap_mode": (AG_SWAP_MODE_CHOICES, {"default": AG_SWAP_MODE_SHARED_SAFE}),
+            },
+            "optional": {
+                "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
+                "ag_max_ratio": ("FLOAT", {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01}),
+                "ag_allow_negative": ("BOOLEAN", {"default": True}),
+                "ag_ramp_mode": (AG_RAMP_MODE_CHOICES, {"default": AG_RAMP_FLAT}),
+                "ag_ramp_power": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 8.0, "step": 0.5, "round": 0.1}),
+                "ag_ramp_floor": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05, "round": 0.01}),
+                "ag_post_cfg_mode": (AG_POST_CFG_MODE_CHOICES, {"default": AG_POST_CFG_KEEP}),
+                "safe_force_clean_swap": ("BOOLEAN", {"default": True}),
+                "uuid_only_noop": ("BOOLEAN", {"default": False}),
+                "debug_swap": ("BOOLEAN", {"default": False}),
+                "debug_metrics": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("DETAILER_HOOK",)
+    FUNCTION = "get_hook"
+    CATEGORY = "sampling/guiders"
+
+    def get_hook(
+        self,
+        bad_model,
+        w_autoguide: float,
+        swap_mode=AG_SWAP_MODE_SHARED_SAFE,
+        ag_delta_mode=AG_DELTA_MODE_BAD_CONDITIONAL,
+        ag_max_ratio=AG_DEFAULT_MAX_RATIO,
+        ag_allow_negative=True,
+        ag_ramp_mode=AG_RAMP_FLAT,
+        ag_ramp_power=2.0,
+        ag_ramp_floor=0.15,
+        ag_post_cfg_mode=AG_POST_CFG_KEEP,
+        safe_force_clean_swap=True,
+        uuid_only_noop=False,
+        debug_swap=False,
+        debug_metrics=False,
+    ):
+        hook = AutoGuidanceImpactDetailerHook(
+            bad_model,
+            w_autoguide=w_autoguide,
+            swap_mode=swap_mode,
+            ag_delta_mode=ag_delta_mode,
+            ag_max_ratio=ag_max_ratio,
+            ag_allow_negative=ag_allow_negative,
+            ag_ramp_mode=ag_ramp_mode,
+            ag_ramp_power=ag_ramp_power,
+            ag_ramp_floor=ag_ramp_floor,
+            ag_post_cfg_mode=ag_post_cfg_mode,
+            safe_force_clean_swap=safe_force_clean_swap,
+            uuid_only_noop=uuid_only_noop,
+            debug_swap=debug_swap,
+            debug_metrics=debug_metrics,
+        )
+        return (hook,)
+
+
 NODE_CLASS_MAPPINGS = {
     "AutoGuidanceCFGGuider": AutoGuidanceCFGGuider,
+    "AutoGuidanceImpactDetailerHookProvider": AutoGuidanceImpactDetailerHookProvider,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AutoGuidanceCFGGuider": "AutoGuidance CFG Guider (good+bad)",
+    "AutoGuidanceImpactDetailerHookProvider": "AutoGuidance Detailer Hook (Impact Pack)",
 }
