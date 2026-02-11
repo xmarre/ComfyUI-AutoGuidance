@@ -1178,6 +1178,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     ag_delta = ag_delta * scale.to(ag_delta.dtype)
 
                     debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+                    if debug_metrics and not hasattr(self, "_ag_dbg_dir_once"):
+                        d1 = d_ag_dir.detach().float()
+                        d2 = d_cfg.detach().float()
+                        n1 = d1.pow(2).sum().sqrt() + 1e-8
+                        n2 = d2.pow(2).sum().sqrt() + 1e-8
+                        cos = float((d1 * d2).sum().cpu() / (n1 * n2))
+                        sig = float(d1.flatten()[:8192].sum().cpu())
+                        print("[AutoGuidance] dir", {"cos_ag_vs_cfg": cos, "ag_dir_sig": sig})
+                        self._ag_dbg_dir_once = True
+
                     if debug_metrics and not hasattr(self, "_ag_dbg_metrics_once"):
                         # Useful sanity checks: if these are ~0, your bad model path isn't actually different.
                         d_cond = (cond_pred_good - bad_cond_pred).float()
