@@ -937,12 +937,17 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
     def predict_noise(self, x, timestep, model_options: Dict[str, Any] | None = None, seed=None, **kwargs):
         """
-        Mirrors comfy.samplers.sampling_function + cfg_function, but injects
-        AutoGuidance delta with configurable post-CFG hook ordering
-        (keep/apply_after/skip via ag_post_cfg_mode).
+        Mirrors comfy.samplers.sampling_function + cfg_function, but injects AutoGuidance.
+        NOTE: Comfy may also apply sampler_post_cfg_function outside the guider. If we handle
+        post-CFG here, we strip the list in-place to avoid double-application.
         """
         if model_options is None:
             model_options = {}
+
+        # IMPORTANT: model_options may be reused by wrappers/caches across calls.
+        # Copy before mutating (we strip post-cfg hooks below).
+        model_options = dict(model_options)
+
         # Ensure wrapper-related options always exist
         if model_options.get("transformer_options", None) is None:
             model_options["transformer_options"] = {}
@@ -953,9 +958,20 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         last = (total_steps is not None and step == total_steps - 1)
 
         post_cfg_mode = str(getattr(self, "ag_post_cfg_mode", AG_POST_CFG_KEEP))
-        post_cfg_fns = model_options.get("sampler_post_cfg_function", []) or []
+        # Copy the hook list for our internal use, but IMPORTANT: strip it from model_options
+        # so Comfy doesn't apply it again outside this guider.
+        orig_post_cfg_fns = model_options.get("sampler_post_cfg_function", []) or []
+        post_cfg_fns = list(orig_post_cfg_fns)
         if post_cfg_mode == AG_POST_CFG_SKIP:
             post_cfg_fns = []
+        # If there were any hooks, strip them in-place to prevent double application downstream.
+        # This is intentional in all modes (including keep) to enforce exactly-once semantics.
+        # (We either run them ourselves, or intentionally skip them.)
+        if orig_post_cfg_fns:
+            try:
+                model_options["sampler_post_cfg_function"] = []
+            except Exception:
+                pass
 
         # IMPORTANT: do NOT let the bad-model pass mutate shared transformer_options
         # that the good-model pass relies on across timesteps.
@@ -1436,7 +1452,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             if ag_delta is not None and post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
                 denoised = denoised + ag_delta
 
-            # Debug how much post_cfg altered the result.
+            # Debug how much post_cfg altered the result (and what we finally return).
             debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
             if debug_metrics and (step == 0 or last):
                 try:
@@ -1446,6 +1462,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     n_pre = _l2(denoised_before_post - cfg_out)
                     n_post = _l2(denoised_after_post - cfg_out)
                     n_change = _l2(denoised_after_post - denoised_before_post)
+                    n_final = _l2(denoised - cfg_out)
                     print(
                         "[AutoGuidance] post_cfg_effect_step",
                         step,
@@ -1453,6 +1470,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                             "n_pre_minus_cfg": n_pre,
                             "n_post_minus_cfg": n_post,
                             "n_post_change": n_change,
+                            "n_final_minus_cfg": n_final,
                         },
                     )
                 except Exception as e:
