@@ -628,6 +628,116 @@ def _restore_y_per_entry(dst_cond: Any, src_pos: Any, src_neg: Any = None) -> An
     return dst_cond
 
 
+def _sig_has_param(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return False
+    return name in sig.parameters
+
+
+def _find_first_key(cond: Any, key: str):
+    if isinstance(cond, Mapping):
+        if key in cond:
+            return cond.get(key)
+        for v in cond.values():
+            if isinstance(v, (Mapping, list, tuple)):
+                out = _find_first_key(v, key)
+                if out is not None:
+                    return out
+        return None
+    if isinstance(cond, (list, tuple)):
+        for v in cond:
+            if isinstance(v, (Mapping, list, tuple)):
+                out = _find_first_key(v, key)
+                if out is not None:
+                    return out
+    return None
+
+
+def _find_first_3d_tensor(cond: Any):
+    if torch.is_tensor(cond) and cond.ndim == 3:
+        return cond
+    if isinstance(cond, Mapping):
+        for v in cond.values():
+            if isinstance(v, (Mapping, list, tuple)) or torch.is_tensor(v):
+                t = _find_first_3d_tensor(v)
+                if t is not None:
+                    return t
+        return None
+    if isinstance(cond, (list, tuple)):
+        for v in cond:
+            if isinstance(v, (Mapping, list, tuple)) or torch.is_tensor(v):
+                t = _find_first_3d_tensor(v)
+                if t is not None:
+                    return t
+    return None
+
+
+def _infer_num_tokens(cond: Any) -> int | None:
+    t = _find_first_3d_tensor(cond)
+    if t is None:
+        return None
+    try:
+        return int(t.shape[1])
+    except Exception:
+        return None
+
+
+def _ensure_key_everywhere(cond: Any, key: str, value) -> None:
+    if value is None:
+        return
+    if isinstance(cond, Mapping):
+        try:
+            if key not in cond:
+                cond[key] = value
+        except Exception:
+            pass
+        for v in cond.values():
+            if isinstance(v, (Mapping, list, tuple)):
+                _ensure_key_everywhere(v, key, value)
+        return
+    if isinstance(cond, (list, tuple)):
+        for v in cond:
+            if isinstance(v, (Mapping, list, tuple)):
+                _ensure_key_everywhere(v, key, value)
+
+
+def _restore_key_per_entry(dst_cond: Any, src_pos: Any, src_neg: Any = None, *, key: str) -> Any:
+    """
+    Restore extra conditioning fields (e.g. num_tokens) per entry without collapsing structures.
+    If src doesn't provide it, infer from a 3D context tensor (shape [B, T, D] -> T).
+    """
+    is_tuple = isinstance(dst_cond, tuple)
+    if isinstance(dst_cond, (list, tuple)):
+        dst_list = list(dst_cond)
+        src_pos_list = list(src_pos) if isinstance(src_pos, (list, tuple)) else None
+        src_neg_list = list(src_neg) if isinstance(src_neg, (list, tuple)) else None
+
+        default_val = _find_first_key(src_pos, key) or _find_first_key(src_neg, key)
+        if default_val is None:
+            default_val = _infer_num_tokens(src_pos) or _infer_num_tokens(src_neg)
+
+        for i in range(len(dst_list)):
+            val = None
+            if src_pos_list is not None and i < len(src_pos_list):
+                val = _find_first_key(src_pos_list[i], key) or _infer_num_tokens(src_pos_list[i])
+            if val is None and src_neg_list is not None and i < len(src_neg_list):
+                val = _find_first_key(src_neg_list[i], key) or _infer_num_tokens(src_neg_list[i])
+            if val is None:
+                val = _infer_num_tokens(dst_list[i]) or default_val
+            if val is not None:
+                _ensure_key_everywhere(dst_list[i], key, val)
+        return tuple(dst_list) if is_tuple else dst_list
+
+    val = _find_first_key(src_pos, key) or _find_first_key(src_neg, key)
+    if val is None:
+        val = _infer_num_tokens(src_pos) or _infer_num_tokens(src_neg) or _infer_num_tokens(dst_cond)
+    if val is not None:
+        _ensure_key_everywhere(dst_cond, key, val)
+    return dst_cond
+
+
 def _looks_like_tensor(v: Any) -> bool:
     return torch.is_tensor(v)
 
@@ -1188,6 +1298,33 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             neg_bad = _ensure_primary_text_cond(neg_bad, uncond_for_good)
             if self.bad_conds is not None:
                 self.bad_conds["negative"] = neg_bad
+
+            # Z-Image / NextDiT requires num_tokens; ensure it exists on bad pass.
+            key = type(getattr(self.inner_bad_model, "diffusion_model", None))
+            if getattr(self, "_ag_needs_num_tokens_key", None) != key:
+                needs = (_find_first_key(positive_cond, "num_tokens") is not None) or (_find_first_key(negative_cond, "num_tokens") is not None)
+                if not needs:
+                    try:
+                        dm = getattr(self.inner_bad_model, "diffusion_model", None)
+                        fn = getattr(dm, "forward", None) if dm is not None else None
+                        needs = bool(fn is not None and _sig_has_param(fn, "num_tokens"))
+                    except Exception:
+                        needs = False
+                self._ag_needs_num_tokens = needs
+                self._ag_needs_num_tokens_key = key
+
+            if self._ag_needs_num_tokens:
+                pos_bad_cond = _restore_key_per_entry(pos_bad_cond, positive_cond, negative_cond, key="num_tokens")
+                neg_bad = _restore_key_per_entry(neg_bad, negative_cond, positive_cond, key="num_tokens")
+                if self.bad_conds is not None:
+                    self.bad_conds["positive"] = pos_bad_cond
+                    self.bad_conds["negative"] = neg_bad
+
+                dbg_nt = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+                if dbg_nt and step == 0 and not hasattr(self, "_ag_dbg_num_tokens_once"):
+                    print("[AG] good num_tokens", _find_first_key(positive_cond, "num_tokens"), _find_first_key(negative_cond, "num_tokens"))
+                    print("[AG] bad  num_tokens", _find_first_key(pos_bad_cond, "num_tokens"), _find_first_key(neg_bad, "num_tokens"))
+                    self._ag_dbg_num_tokens_once = True
             conds_bad: List[Any] = [pos_bad_cond, neg_bad]
 
             bad_model_options_last = None
@@ -1308,7 +1445,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     "cond_denoised": bad_cond_pred,
                     "uncond_denoised": bad_uncond_pred,
                     "model": self.inner_bad_model,
-                    "model_options": bad_model_options_last or _clone_model_options_for_bad(model_options),
+                    "model_options": bad_model_options_last if bad_model_options_last is not None else _clone_model_options_for_bad(model_options),
                 }
                 bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
             else:
