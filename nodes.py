@@ -97,9 +97,44 @@ AG_DELTA_MODE_CHOICES = [
     AG_DELTA_MODE_PROJECT_CFG,
 ]
 
+AG_RAMP_FLAT = "flat"
+AG_RAMP_DETAIL_LATE = "detail_late"
+AG_RAMP_COMPOSE_EARLY = "compose_early"
+AG_RAMP_MID_PEAK = "mid_peak"
+
+AG_RAMP_MODE_CHOICES = [
+    AG_RAMP_FLAT,
+    AG_RAMP_DETAIL_LATE,
+    AG_RAMP_COMPOSE_EARLY,
+    AG_RAMP_MID_PEAK,
+]
+
 # Default cap for AG magnitude relative to CFG-direction magnitude.
 # Old code used 0.10 which is often visually near-invisible.
 AG_DEFAULT_MAX_RATIO = 0.35
+
+
+def _ag_ramp_factor(prog01: float, *, mode: str, power: float) -> float:
+    """
+    prog01: 0 early (high sigma) -> 1 late (low sigma)
+    Returns factor in [0,1] to scale max_ratio.
+    """
+    p = max(1e-6, float(power))
+    x = max(0.0, min(1.0, float(prog01)))
+
+    if mode == AG_RAMP_FLAT:
+        f = 1.0
+    elif mode == AG_RAMP_DETAIL_LATE:
+        f = x ** p
+    elif mode == AG_RAMP_COMPOSE_EARLY:
+        f = (1.0 - x) ** p
+    elif mode == AG_RAMP_MID_PEAK:
+        bell = 4.0 * x * (1.0 - x)
+        f = max(0.0, bell) ** p
+    else:
+        f = 1.0
+
+    return max(0.0, min(1.0, float(f)))
 
 
 def _patcher_has_active_patches(patcher) -> bool:
@@ -141,6 +176,39 @@ def _debug_print_weight_signature_once(model, patcher, *, tag: str, enabled: boo
         setattr(model, key, True)
     except Exception as e:
         print(f"[AutoGuidance] signature debug failed for {tag}: {e!r}")
+
+
+def _layer_digest(model, name: str):
+    try:
+        for param_name, param in model.named_parameters():
+            if param_name == name:
+                t = param.detach().float().flatten()
+                return float(t[:4096].sum().cpu()), float(t[:4096].abs().sum().cpu())
+    except Exception:
+        pass
+    return None
+
+
+def _debug_print_layer_digest_once(
+    model,
+    patcher,
+    *,
+    enabled: bool | None = None,
+    layer_name: str = "diffusion_model.input_blocks.1.0.in_layers.2.weight",
+) -> None:
+    if enabled is None:
+        enabled = bool(getattr(model, "_ag_debug_swap", False)) or os.environ.get("AG_DEBUG_SWAP", "0") == "1"
+    if not enabled:
+        return
+
+    uuid = getattr(patcher, "patches_uuid", None)
+    key = f"_ag_dbg_layer_once_{uuid}_{id(patcher)}"
+    if hasattr(model, key):
+        return
+
+    digest = _layer_digest(model, layer_name)
+    print("[AutoGuidance] layer_digest", {"layer": layer_name, "uuid": uuid, "digest": digest})
+    setattr(model, key, True)
 
 
 def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
@@ -242,13 +310,17 @@ def _activate_patcher_for_forward(
 
     device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
 
+    def _debug_after_activate() -> None:
+        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        _debug_print_layer_digest_once(m, patcher, enabled=debug_swap)
+
     if safe_force_clean:
         # Avoid doing the expensive work repeatedly if we already activated this patcher last time.
         last_id = getattr(m, "_ag_last_patcher_id", None)
         if last_id == id(patcher):
             m.current_patcher = patcher
             m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
-            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+            _debug_after_activate()
             return
 
         # Force-remove any lingering peer patches, then apply the requested patcher.
@@ -264,7 +336,7 @@ def _activate_patcher_for_forward(
         m.current_patcher = patcher
         m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
         m._ag_last_patcher_id = id(patcher)
-        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        _debug_after_activate()
         return
 
     # UUIDs are not always reliable on all Comfy builds. Only use UUID ownership
@@ -288,7 +360,7 @@ def _activate_patcher_for_forward(
     can_noop_by_uuid = (want_uuid is not None and cur_uuid is not None)
     if can_noop_by_uuid and cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
-        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        _debug_after_activate()
         return
 
     # (device already computed above)
@@ -323,7 +395,7 @@ def _activate_patcher_for_forward(
             if last_id == id(patcher):
                 m.current_patcher = patcher
                 m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
-                _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+                _debug_after_activate()
                 return
 
             for p in (*peer_patchers, patcher):
@@ -338,7 +410,7 @@ def _activate_patcher_for_forward(
             m.current_patcher = patcher
             m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
             m._ag_last_patcher_id_fast = id(patcher)
-            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+            _debug_after_activate()
             return
 
         # Less strict: unpatch inferred owner only, still using safe patch_model.
@@ -357,7 +429,7 @@ def _activate_patcher_for_forward(
         _call_patch_model_safe(patcher, device=device)
         m.current_patcher = patcher
         m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
-        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        _debug_after_activate()
         return
 
     def _unpatch_owner(owner) -> None:
@@ -400,14 +472,14 @@ def _activate_patcher_for_forward(
     can_noop_by_uuid = (want_uuid is not None and cur_uuid is not None)
     if can_noop_by_uuid and cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
-        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        _debug_after_activate()
         return
 
     _call_patch_model_safe(patcher, device=device)
 
     m.current_patcher = patcher
     m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
-    _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+    _debug_after_activate()
 
 
 def _sig_accepts_kw(fn, name: str) -> bool:
@@ -647,6 +719,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         ag_delta_mode: str = AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio: float = AG_DEFAULT_MAX_RATIO,
         ag_allow_negative: bool = True,
+        ag_ramp_mode: str = AG_RAMP_FLAT,
+        ag_ramp_power: float = 2.0,
+        ag_ramp_floor: float = 0.0,
         safe_force_clean_swap: bool = True,
         uuid_only_noop: bool = False,
         debug_swap: bool = False,
@@ -661,6 +736,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.ag_delta_mode: str = str(ag_delta_mode)
         self.ag_max_ratio: float = float(ag_max_ratio)
         self.ag_allow_negative: bool = bool(ag_allow_negative)
+        self.ag_ramp_mode: str = str(ag_ramp_mode)
+        self.ag_ramp_power: float = float(ag_ramp_power)
+        self.ag_ramp_floor: float = float(ag_ramp_floor)
         self.safe_force_clean_swap: bool = bool(safe_force_clean_swap)
         self.uuid_only_noop: bool = bool(uuid_only_noop)
         self.debug_swap: bool = bool(debug_swap)
@@ -731,12 +809,27 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         except Exception:
             self._ag_sigma_max = None
         sigmas = sigmas.to(device)
+        self._ag_step = 0
+        try:
+            self._ag_steps_total = int(sigmas.shape[0])
+        except Exception:
+            self._ag_steps_total = None
 
         comfy.samplers.cast_to_load_options(self.model_options, device=device, dtype=self.model_patcher.model_dtype())
 
         try:
             self.model_patcher.pre_run()
             self.bad_model_patcher.pre_run()
+
+            # Dual-model sanity: confirm good/bad model weights differ when swap activation is not used.
+            if getattr(self, "swap_mode", None) == AG_SWAP_MODE_DUAL_MODELS:
+                dbg = bool(getattr(self, "debug_swap", False)) or (os.environ.get("AG_DEBUG_SWAP", "0") == "1")
+                if dbg and not hasattr(self, "_ag_dbg_dual_digest_once"):
+                    layer = "diffusion_model.input_blocks.1.0.in_layers.2.weight"
+                    gm = getattr(self.model_patcher, "model", None)
+                    bm = getattr(self.bad_model_patcher, "model", None)
+                    print("[AutoGuidance] dual_layer_digest", {"good": _layer_digest(gm, layer), "bad": _layer_digest(bm, layer)})
+                    self._ag_dbg_dual_digest_once = True
 
             output = self.inner_sample(
                 noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed
@@ -838,6 +931,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         # Ensure wrapper-related options always exist
         if model_options.get("transformer_options", None) is None:
             model_options["transformer_options"] = {}
+
+        step = int(getattr(self, "_ag_step", 0))
+        self._ag_step = step + 1
+        total_steps = getattr(self, "_ag_steps_total", None)
+        last = (total_steps is not None and step == total_steps - 1)
 
         # IMPORTANT: do NOT let the bad-model pass mutate shared transformer_options
         # that the good-model pass relies on across timesteps.
@@ -1206,12 +1304,20 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     n_delta = ag_delta.float().pow(2).sum().sqrt() + 1e-8
                     ratio = max_ratio
                     sigma_max = getattr(self, "_ag_sigma_max", None)
-                    if sigma_max is not None and sigma_max > 0:
-                        sigma_cur = _to_sigma_scalar(timestep)
-                        if sigma_cur is not None:
-                            prog = 1.0 - (sigma_cur / sigma_max)  # 0 early -> 1 late
-                            prog = max(0.0, min(1.0, prog))
-                            ratio = max_ratio * (prog * prog)  # quadratic ramp
+                    sigma_cur = None
+                    prog = None
+                    ramp_factor = 1.0
+                    total_steps = getattr(self, "_ag_steps_total", None)
+                    if total_steps is not None and int(total_steps) > 1:
+                        prog = float(step) / float(int(total_steps) - 1)  # 0 early -> 1 late
+                        prog = max(0.0, min(1.0, prog))
+                        ramp_mode = str(getattr(self, "ag_ramp_mode", AG_RAMP_FLAT))
+                        ramp_power = float(getattr(self, "ag_ramp_power", 2.0))
+                        ramp_floor = float(getattr(self, "ag_ramp_floor", 0.0))
+                        ramp_floor = max(0.0, min(1.0, ramp_floor))
+
+                        ramp_factor = _ag_ramp_factor(prog, mode=ramp_mode, power=ramp_power)
+                        ratio = max_ratio * (ramp_floor + (1.0 - ramp_floor) * ramp_factor)
 
                     limit = ratio * n_cfg
                     scale = torch.clamp(limit / (n_delta + 1e-8), max=1.0)
@@ -1229,17 +1335,26 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         print("[AutoGuidance] dir", {"cos_ag_vs_cfg": cos, "ag_dir_sig": sig})
                         self._ag_dbg_dir_once = True
 
-                    if debug_metrics and not hasattr(self, "_ag_dbg_metrics_once"):
+                    if debug_metrics and (step == 0 or last):
+                        sigma_cur = _to_sigma_scalar(timestep)
                         # Useful sanity checks: if these are ~0, your bad model path isn't actually different.
                         d_cond = (cond_pred_good - bad_cond_pred).float()
                         n_cond = d_cond.pow(2).sum().sqrt() + 1e-8
                         print(
-                            "[AutoGuidance] metrics",
+                            "[AutoGuidance] metrics_step",
+                            step,
                             {
                                 "mode": mode,
                                 "w_ag": float(self.w_ag),
                                 "w": float(w),
                                 "ag_max_ratio": float(max_ratio),
+                                "ag_ramp_mode": str(getattr(self, "ag_ramp_mode", AG_RAMP_FLAT)),
+                                "ag_ramp_power": float(getattr(self, "ag_ramp_power", 2.0)),
+                                "ag_ramp_floor": float(getattr(self, "ag_ramp_floor", 0.0)),
+                                "sigma_max": float(sigma_max) if sigma_max is not None else None,
+                                "sigma_cur": float(sigma_cur) if sigma_cur is not None else None,
+                                "prog": float(prog) if prog is not None else None,
+                                "ramp_factor": float(ramp_factor),
                                 "ratio_eff": float(ratio),
                                 "limit": float(limit.detach().cpu()) if torch.is_tensor(limit) else float(limit),
                                 "n_cfg": float(n_cfg.detach().cpu()),
@@ -1249,7 +1364,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                                 "n_good_minus_bad_cond": float(n_cond.detach().cpu()),
                             },
                         )
-                        self._ag_dbg_metrics_once = True
 
                 denoised = cfg_out + ag_delta
 
@@ -1322,6 +1436,15 @@ class AutoGuidanceCFGGuider:
                 ),
                 # Only affects project_cfg mode; when False, opposite-direction AG becomes 0.
                 "ag_allow_negative": ("BOOLEAN", {"default": True}),
+                # Ramp for AG cap over denoise progress:
+                # - flat: constant cap (default, avoids zero AG at early steps)
+                # - detail_late: stronger late (detail emphasis)
+                # - compose_early: stronger early (composition emphasis)
+                # - mid_peak: strongest at mid-steps
+                "ag_ramp_mode": (AG_RAMP_MODE_CHOICES, {"default": AG_RAMP_FLAT}),
+                "ag_ramp_power": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 8.0, "step": 0.5, "round": 0.1}),
+                # Minimum always-on fraction of ag_max_ratio.
+                "ag_ramp_floor": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05, "round": 0.01}),
 
                 # === Swap/ownership safety tuning ===
                 # In shared_safe_low_vram mode, force a clean swap every time we switch between good/bad.
@@ -1355,6 +1478,9 @@ class AutoGuidanceCFGGuider:
         ag_delta_mode=AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio=AG_DEFAULT_MAX_RATIO,
         ag_allow_negative=True,
+        ag_ramp_mode=AG_RAMP_FLAT,
+        ag_ramp_power=2.0,
+        ag_ramp_floor=0.15,
         safe_force_clean_swap=True,
         uuid_only_noop=False,
         debug_swap=True,
@@ -1367,6 +1493,9 @@ class AutoGuidanceCFGGuider:
             ag_delta_mode=ag_delta_mode,
             ag_max_ratio=ag_max_ratio,
             ag_allow_negative=ag_allow_negative,
+            ag_ramp_mode=ag_ramp_mode,
+            ag_ramp_power=ag_ramp_power,
+            ag_ramp_floor=ag_ramp_floor,
             safe_force_clean_swap=safe_force_clean_swap,
             uuid_only_noop=uuid_only_noop,
             debug_swap=debug_swap,
