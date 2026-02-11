@@ -972,10 +972,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 model_options["sampler_post_cfg_function"] = []
             except Exception:
                 pass
-
-        # IMPORTANT: do NOT let the bad-model pass mutate shared transformer_options
-        # that the good-model pass relies on across timesteps.
-        bad_model_options = _clone_model_options_for_bad(model_options)
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
 
         def _patch_info(p):
@@ -1194,7 +1190,19 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 self.bad_conds["negative"] = neg_bad
             conds_bad: List[Any] = [pos_bad_cond, neg_bad]
 
+            bad_model_options_last = None
+
             def _run_bad(conds_list: List[Any]) -> List[Any]:
+                nonlocal bad_model_options_last
+                # IMPORTANT: build bad_model_options *after* the good pass and any sampler_pre_cfg hooks.
+                # Some model families (e.g. NextDiT used by Z-Image) inject per-step fields (like num_tokens)
+                # into model_options/transformer_options during the good pass. If we clone too early, the bad
+                # pass can miss those required fields and crash.
+                #
+                # Keep this clone inside _run_bad so every bad-pass invocation gets a fresh, isolated copy,
+                # including retry paths in the exception handlers below.
+                bad_model_options = _clone_model_options_for_bad(model_options)
+                bad_model_options_last = bad_model_options
                 if shared_model:
                     _activate(self.bad_model_patcher, (self.model_patcher,))
                     if not hasattr(self, "_ag_dbg_flip_bad_once"):
@@ -1300,7 +1308,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     "cond_denoised": bad_cond_pred,
                     "uncond_denoised": bad_uncond_pred,
                     "model": self.inner_bad_model,
-                    "model_options": bad_model_options,
+                    "model_options": bad_model_options_last or _clone_model_options_for_bad(model_options),
                 }
                 bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
             else:
