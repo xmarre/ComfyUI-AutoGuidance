@@ -67,8 +67,10 @@ AG_SWAP_MODE_CHOICES = [
 
 AG_DELTA_MODE_RAW = "raw_delta"
 AG_DELTA_MODE_PROJECT_CFG = "project_cfg"
+AG_DELTA_MODE_BAD_CONDITIONAL = "bad_conditional"
 
 AG_DELTA_MODE_CHOICES = [
+    AG_DELTA_MODE_BAD_CONDITIONAL,
     AG_DELTA_MODE_RAW,
     AG_DELTA_MODE_PROJECT_CFG,
 ]
@@ -76,6 +78,47 @@ AG_DELTA_MODE_CHOICES = [
 # Default cap for AG magnitude relative to CFG-direction magnitude.
 # Old code used 0.10 which is often visually near-invisible.
 AG_DEFAULT_MAX_RATIO = 0.35
+
+
+def _patcher_has_active_patches(patcher) -> bool:
+    backup = getattr(patcher, "backup", None)
+    if isinstance(backup, dict) and len(backup) > 0:
+        return True
+
+    obj_backup = getattr(patcher, "object_patches_backup", None)
+    if isinstance(obj_backup, dict) and len(obj_backup) > 0:
+        return True
+
+    return False
+
+
+def _infer_single_active_owner(patchers):
+    active_patchers = [candidate for candidate in patchers if _patcher_has_active_patches(candidate)]
+    if len(active_patchers) == 1:
+        return active_patchers[0], False
+    if len(active_patchers) > 1:
+        return None, True
+    return None, False
+
+
+def _debug_print_weight_signature_once(model, patcher, *, tag: str, enabled: bool | None = None) -> None:
+    if enabled is None:
+        enabled = bool(getattr(model, "_ag_debug_swap", False)) or os.environ.get("AG_DEBUG_SWAP", "0") == "1"
+    if not enabled:
+        return
+
+    key = f"_ag_dbg_sig_once_{tag}_{id(patcher)}"
+    if hasattr(model, key):
+        return
+
+    try:
+        for _, param in model.named_parameters():
+            sig = float(param.detach().flatten()[:2048].float().sum().cpu())
+            print("[AutoGuidance] active patcher", tag, "sig", sig)
+            break
+        setattr(model, key, True)
+    except Exception as e:
+        print(f"[AutoGuidance] signature debug failed for {tag}: {e!r}")
 
 
 def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
@@ -216,6 +259,9 @@ def _activate_patcher_for_forward(
     *,
     peer_patchers: tuple[comfy.model_patcher.ModelPatcher, ...] = (),
     fast_weight_swap: bool = False,
+    safe_force_clean_swap: bool | None = None,
+    uuid_only_noop: bool | None = None,
+    debug_swap: bool | None = None,
 ) -> None:
     m = getattr(patcher, "model", None)
     if m is None:
@@ -228,26 +274,71 @@ def _activate_patcher_for_forward(
     # IMPORTANT: only enabled via node/UI.
     fast_mode = bool(fast_weight_swap)
 
-    uuid_only_noop = os.environ.get("AG_UUID_ONLY_NOOP", "0") == "1"
+    # In shared_safe mode (fast_mode=False), default to a forced clean swap.
+    # (Prevents state leak across wrapper stacks on some Comfy builds.)
+    if safe_force_clean_swap is None:
+        safe_force_clean_swap = (os.environ.get("AG_SAFE_FORCE_CLEAN_SWAP", "1") == "1")
+    safe_force_clean = (not fast_mode) and bool(safe_force_clean_swap)
+
+    if uuid_only_noop is None:
+        uuid_only_noop = (os.environ.get("AG_UUID_ONLY_NOOP", "0") == "1")
     want_uuid = getattr(patcher, "patches_uuid", None)
     cur_uuid = getattr(m, "current_weight_patches_uuid", None)
     cur_owner = getattr(m, "current_patcher", None)
+    all_patchers = (patcher, *peer_patchers)
 
-    if cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid:
+    device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
+
+    if safe_force_clean:
+        # Avoid doing the expensive work repeatedly if we already activated this patcher last time.
+        last_id = getattr(m, "_ag_last_patcher_id", None)
+        if last_id == id(patcher):
+            m.current_patcher = patcher
+            m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+            return
+
+        # Force-remove any lingering peer patches, then apply the requested patcher.
+        for p in (*peer_patchers, patcher):
+            try:
+                _call_unpatch_model_compat(p, device=device)
+            except Exception:
+                pass
+        m.current_weight_patches_uuid = None
+        m.current_patcher = None
+
+        _call_patch_model_safe(patcher, device=device)
+        m.current_patcher = patcher
+        m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+        m._ag_last_patcher_id = id(patcher)
+        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        return
+
+    # UUIDs are not always reliable on all Comfy builds. Only use UUID ownership
+    # resolution when both sides are concrete. Otherwise infer from active backups.
+    can_use_uuid_resolution = (want_uuid is not None and cur_uuid is not None)
+    if can_use_uuid_resolution and (cur_owner is None or getattr(cur_owner, "patches_uuid", None) != cur_uuid):
         resolved = None
-        for p in (patcher, *peer_patchers):
-            if getattr(p, "patches_uuid", None) == cur_uuid:
-                resolved = p
+        for candidate in all_patchers:
+            if getattr(candidate, "patches_uuid", None) == cur_uuid:
+                resolved = candidate
                 break
         if resolved is not None:
             cur_owner = resolved
 
+    if cur_owner is None:
+        inferred_owner, _ = _infer_single_active_owner(all_patchers)
+        if inferred_owner is not None:
+            cur_owner = inferred_owner
+
     real_owner = getattr(m, "current_patcher", None)
-    if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
+    can_noop_by_uuid = (want_uuid is not None and cur_uuid is not None)
+    if can_noop_by_uuid and cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
+        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
         return
 
-    device = getattr(patcher, "load_device", None) or getattr(m, "device", None)
+    # (device already computed above)
 
     def _unpatch_owner_fast(owner) -> None:
         if owner is None:
@@ -257,10 +348,27 @@ def _activate_patcher_for_forward(
         if getattr(m, "current_patcher", None) is owner:
             m.current_patcher = None
 
+    def _unpatch_active_peers() -> None:
+        cleaned = False
+        for candidate in peer_patchers:
+            if _patcher_has_active_patches(candidate):
+                _call_unpatch_model_compat(candidate, device=device)
+                cleaned = True
+        if cleaned:
+            m.current_weight_patches_uuid = None
+            if getattr(m, "current_patcher", None) in peer_patchers:
+                m.current_patcher = None
+
     # Try fast path first when explicitly enabled. Fall back to safe path if unsupported.
     if fast_mode:
         _prepare_fast_weight_swap(m, patcher, peer_patchers=peer_patchers, device=device)
         owner = getattr(m, "current_patcher", None) or cur_owner
+        if owner is None:
+            inferred_owner, ambiguous = _infer_single_active_owner(all_patchers)
+            if inferred_owner is not None:
+                owner = inferred_owner
+            elif ambiguous:
+                _unpatch_active_peers()
         if owner is not None and owner is not patcher:
             _unpatch_owner_fast(owner)
         elif owner is patcher and cur_uuid != want_uuid:
@@ -269,6 +377,7 @@ def _activate_patcher_for_forward(
         if _call_patch_model_fast_weightsafe(patcher, device=device):
             m.current_patcher = patcher
             m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
             return
         else:
             # Fast attempt may have applied partial object patches; clean up before slow path.
@@ -309,6 +418,13 @@ def _activate_patcher_for_forward(
         if getattr(m, "current_patcher", None) is owner:
             m.current_patcher = None
 
+    if cur_owner is None:
+        inferred_owner, ambiguous = _infer_single_active_owner(all_patchers)
+        if inferred_owner is not None:
+            cur_owner = inferred_owner
+        elif ambiguous:
+            _unpatch_active_peers()
+
     if cur_owner is not None and cur_owner is not patcher:
         _unpatch_owner(cur_owner)
     elif cur_owner is patcher and cur_uuid != want_uuid:
@@ -318,14 +434,17 @@ def _activate_patcher_for_forward(
     cur_owner = getattr(m, "current_patcher", None)
 
     real_owner = getattr(m, "current_patcher", None)
-    if cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
+    can_noop_by_uuid = (want_uuid is not None and cur_uuid is not None)
+    if can_noop_by_uuid and cur_uuid == want_uuid and (uuid_only_noop or real_owner is patcher):
         m.current_patcher = patcher
+        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
         return
 
     _call_patch_model_safe(patcher, device=device)
 
     m.current_patcher = patcher
     m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+    _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
 
 
 def _sig_accepts_kw(fn, name: str) -> bool:
@@ -562,9 +681,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         bad_model,
         *,
         swap_mode: str = AG_SWAP_MODE_SHARED_SAFE,
-        ag_delta_mode: str = AG_DELTA_MODE_RAW,
+        ag_delta_mode: str = AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio: float = AG_DEFAULT_MAX_RATIO,
         ag_allow_negative: bool = True,
+        safe_force_clean_swap: bool = True,
+        uuid_only_noop: bool = False,
+        debug_swap: bool = False,
+        debug_metrics: bool = False,
     ):
         super().__init__(good_model)
         self.bad_model_patcher = bad_model
@@ -575,6 +698,10 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.ag_delta_mode: str = str(ag_delta_mode)
         self.ag_max_ratio: float = float(ag_max_ratio)
         self.ag_allow_negative: bool = bool(ag_allow_negative)
+        self.safe_force_clean_swap: bool = bool(safe_force_clean_swap)
+        self.uuid_only_noop: bool = bool(uuid_only_noop)
+        self.debug_swap: bool = bool(debug_swap)
+        self.debug_metrics: bool = bool(debug_metrics)
 
     def set_conds(self, positive, negative) -> None:
         # Keep the same conditioning dict style used by CFGGuider-based guiders.
@@ -761,8 +888,31 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
         fast_swap = (swap_mode == AG_SWAP_MODE_SHARED_FAST)
 
+
+        def _activate(p, peers: tuple[comfy.model_patcher.ModelPatcher, ...]) -> None:
+            if not shared_model:
+                return
+
+            # Allow environment variables to force-enable/disable debug/safety even when the node
+            # is used with default UI values.
+            safe_force_clean = bool(getattr(self, "safe_force_clean_swap", True))
+            env_safe = os.environ.get("AG_SAFE_FORCE_CLEAN_SWAP", None)
+            if env_safe in ("0", "1"):
+                safe_force_clean = (env_safe == "1")
+
+            uuid_noop = bool(getattr(self, "uuid_only_noop", False)) or (os.environ.get("AG_UUID_ONLY_NOOP", "0") == "1")
+            dbg_swap = bool(getattr(self, "debug_swap", False)) or (os.environ.get("AG_DEBUG_SWAP", "0") == "1")
+
+            _activate_patcher_for_forward(
+                p,
+                peer_patchers=peers,
+                fast_weight_swap=fast_swap,
+                safe_force_clean_swap=safe_force_clean,
+                uuid_only_noop=uuid_noop,
+                debug_swap=dbg_swap,
+            )
         if shared_model:
-            _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+            _activate(self.model_patcher, (self.bad_model_patcher,))
 
         if not hasattr(self, "_ag_dbg_once"):
             try:
@@ -788,7 +938,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_good(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
                     if not hasattr(self, "_ag_dbg_flip_good_once"):
                         m = getattr(self.model_patcher, "model", None)
                         print(
@@ -816,7 +966,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_pre_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "conds": conds_good,
@@ -845,7 +995,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             if "sampler_cfg_function" in model_options:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "cond": x - cond_pred,
@@ -867,7 +1017,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 denoised = cfg_out
                 for fn in model_options.get("sampler_post_cfg_function", []):
                     if shared_model:
-                        _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                        _activate(self.model_patcher, (self.bad_model_patcher,))
                     self.inner_model.current_patcher = self.model_patcher
                     denoised = fn(
                         {
@@ -887,7 +1037,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         }
                     )
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
                 return denoised
 
             # Prefer bad-model filtered conds for hook compatibility, but restore 'y' if required.
@@ -913,7 +1063,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             def _run_bad(conds_list: List[Any]) -> List[Any]:
                 if shared_model:
-                    _activate_patcher_for_forward(self.bad_model_patcher, peer_patchers=(self.model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.bad_model_patcher, (self.model_patcher,))
                     if not hasattr(self, "_ag_dbg_flip_bad_once"):
                         m = getattr(self.bad_model_patcher, "model", None)
                         print(
@@ -988,11 +1138,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             # Some workflows install a sampler_cfg_function (e.g. cfg-rescale, custom thresholding).
             if "sampler_cfg_function" in model_options:
                 if shared_model:
-                    _activate_patcher_for_forward(
-                        self.bad_model_patcher,
-                        peer_patchers=(self.model_patcher,),
-                        fast_weight_swap=fast_swap,
-                    )
+                    _activate(self.bad_model_patcher, (self.model_patcher,))
                 self.inner_bad_model.current_patcher = self.bad_model_patcher
                 args_bad = {
                     "cond": x - bad_cond_pred,
@@ -1015,24 +1161,32 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             self.inner_model.current_patcher = self.model_patcher
 
             d_cfg = cond_pred_good - uncond_pred_good
-            d_ag = cfg_out - bad_cfg_out
+            # Two useful deltas:
+            # - d_ag_cfg: delta vs bad model run with the same CFG pipeline
+            # - d_ag_ref: delta vs bad model conditional-only (paper-style "bad" reference)
+            d_ag_cfg = cfg_out - bad_cfg_out
+            d_ag_ref = cfg_out - bad_cond_pred
             w = max(float(self.w_ag - 1.0), 0.0)
             if w <= 0.0:
                 denoised = cfg_out
             else:
-                mode = getattr(self, "ag_delta_mode", AG_DELTA_MODE_RAW)
+                mode = getattr(self, "ag_delta_mode", AG_DELTA_MODE_BAD_CONDITIONAL)
                 allow_neg = bool(getattr(self, "ag_allow_negative", True))
 
                 # Choose AG direction.
                 if mode == AG_DELTA_MODE_PROJECT_CFG:
                     cfg_denom = (d_cfg.float() * d_cfg.float()).sum() + 1e-8
-                    alpha = (d_ag.float() * d_cfg.float()).sum() / cfg_denom
+                    # Project the "push away from bad" direction onto the CFG direction.
+                    alpha = (d_ag_ref.float() * d_cfg.float()).sum() / cfg_denom
                     if not allow_neg:
                         alpha = torch.clamp(alpha, min=0.0)
                     d_ag_dir = d_cfg * alpha.to(d_cfg.dtype)
+                elif mode == AG_DELTA_MODE_RAW:
+                    # Delta between good- and bad-guided outputs.
+                    d_ag_dir = d_ag_cfg
                 else:
-                    # Default: keep full delta between good- and bad-guided outputs.
-                    d_ag_dir = d_ag
+                    # Strongest + most LoRA-sensitive: compare good CFG output to bad conditional-only output.
+                    d_ag_dir = d_ag_ref
 
                 ag_delta = w * d_ag_dir
 
@@ -1045,7 +1199,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     scale = torch.clamp(limit / n_delta, max=1.0)
                     ag_delta = ag_delta * scale.to(ag_delta.dtype)
 
-                    if os.environ.get("AG_DEBUG_METRICS", "0") == "1" and not hasattr(self, "_ag_dbg_metrics_once"):
+                    debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+                    if debug_metrics and not hasattr(self, "_ag_dbg_metrics_once"):
+                        # Useful sanity checks: if these are ~0, your bad model path isn't actually different.
+                        d_cond = (cond_pred_good - bad_cond_pred).float()
+                        n_cond = d_cond.pow(2).sum().sqrt() + 1e-8
                         print(
                             "[AutoGuidance] metrics",
                             {
@@ -1056,6 +1214,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                                 "n_cfg": float(n_cfg.detach().cpu()),
                                 "n_delta": float(n_delta.detach().cpu()),
                                 "scale": float(scale.detach().cpu()),
+                                "n_good_minus_bad_cond": float(n_cond.detach().cpu()),
                             },
                         )
                         self._ag_dbg_metrics_once = True
@@ -1064,7 +1223,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             for fn in model_options.get("sampler_post_cfg_function", []):
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
                 args = {
                     "denoised": denoised,
@@ -1084,12 +1243,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 denoised = fn(args)
 
             if shared_model:
-                _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                _activate(self.model_patcher, (self.bad_model_patcher,))
             return denoised
         finally:
             try:
                 if shared_model:
-                    _activate_patcher_for_forward(self.model_patcher, peer_patchers=(self.bad_model_patcher,), fast_weight_swap=fast_swap)
+                    _activate(self.model_patcher, (self.bad_model_patcher,))
             except Exception:
                 pass
             if self.inner_bad_model is not None:
@@ -1124,13 +1283,27 @@ class AutoGuidanceCFGGuider:
             },
             "optional": {
                 # If AG looks too subtle, increase ag_max_ratio first (0.35 -> 0.75).
-                "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_RAW}),
+                "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
                 "ag_max_ratio": (
                     "FLOAT",
                     {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01},
                 ),
                 # Only affects project_cfg mode; when False, opposite-direction AG becomes 0.
                 "ag_allow_negative": ("BOOLEAN", {"default": True}),
+
+                # === Swap/ownership safety tuning ===
+                # In shared_safe_low_vram mode, force a clean swap every time we switch between good/bad.
+                # This is slower but fixes "washed out" or "same output" issues on some ComfyUI builds.
+                "safe_force_clean_swap": ("BOOLEAN", {"default": True}),
+                # If enabled, treat "same UUID" as a no-op without further ownership validation.
+                # Useful for debugging, but can hide broken swaps.
+                "uuid_only_noop": ("BOOLEAN", {"default": False}),
+
+                # === Debug ===
+                # Print a one-time lightweight weight signature per active patcher swap.
+                "debug_swap": ("BOOLEAN", {"default": True}),
+                # Print one-time AG magnitude metrics (including good-vs-bad-cond distance).
+                "debug_metrics": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -1147,9 +1320,13 @@ class AutoGuidanceCFGGuider:
         cfg: float,
         w_autoguide: float,
         swap_mode=AG_SWAP_MODE_SHARED_SAFE,
-        ag_delta_mode=AG_DELTA_MODE_RAW,
+        ag_delta_mode=AG_DELTA_MODE_BAD_CONDITIONAL,
         ag_max_ratio=AG_DEFAULT_MAX_RATIO,
         ag_allow_negative=True,
+        safe_force_clean_swap=True,
+        uuid_only_noop=False,
+        debug_swap=True,
+        debug_metrics=True,
     ):
         guider = Guider_AutoGuidanceCFG(
             good_model,
@@ -1158,7 +1335,19 @@ class AutoGuidanceCFGGuider:
             ag_delta_mode=ag_delta_mode,
             ag_max_ratio=ag_max_ratio,
             ag_allow_negative=ag_allow_negative,
+            safe_force_clean_swap=safe_force_clean_swap,
+            uuid_only_noop=uuid_only_noop,
+            debug_swap=debug_swap,
+            debug_metrics=debug_metrics,
         )
+        # Make swap debugging available inside patcher-level helpers.
+        for _p in (good_model, bad_model):
+            _m = getattr(_p, "model", None)
+            if _m is not None:
+                try:
+                    setattr(_m, "_ag_debug_swap", bool(debug_swap))
+                except Exception:
+                    pass
         guider.set_conds(positive, negative)
         guider.set_scales(cfg=cfg, w_ag=w_autoguide)
         return (guider,)
