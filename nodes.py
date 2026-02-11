@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import inspect
 import os
+from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Dict, List
 
@@ -812,6 +813,32 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         bad_model_options = _clone_model_options_for_bad(model_options)
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
 
+        def _patch_info(p):
+            patches = getattr(p, "patches", None)
+            if not isinstance(patches, dict):
+                return {"uuid": getattr(p, "patches_uuid", None), "count": None, "top": []}
+            c = Counter(k.split(".", 1)[0] for k in patches.keys())
+            keys = list(patches.keys())
+            return {
+                "uuid": getattr(p, "patches_uuid", None),
+                "count": len(patches),
+                "top": c.most_common(10),
+                "sample_keys": keys[:8],
+            }
+
+        dbg = bool(getattr(self, "debug_swap", False)) or (os.environ.get("AG_DEBUG_SWAP", "0") == "1")
+        patch_dbg_key = f"_ag_dbg_patches_once_{getattr(self.bad_model_patcher, 'patches_uuid', None)}"
+        if dbg and not hasattr(self, patch_dbg_key):
+            print(
+                "[AutoGuidance] patch_info",
+                {
+                    "good": _patch_info(self.model_patcher),
+                    "bad": _patch_info(self.bad_model_patcher),
+                    "shared": shared_model,
+                },
+            )
+            setattr(self, patch_dbg_key, True)
+
         # 3-mode policy:
         # - shared_safe_low_vram: always use slow correctness-first patching
         # - shared_fast_extra_vram: use fast weightsafe swap (extra VRAM)
@@ -1074,6 +1101,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 out_bad = _run_bad(conds_bad)
             bad_cond_pred = out_bad[0]
             bad_uncond_pred = out_bad[1]
+
+            dbg = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+            bad_sig_key = f"_ag_dbg_badcond_sig_once_{getattr(self.bad_model_patcher, 'patches_uuid', None)}"
+            if dbg and not hasattr(self, bad_sig_key):
+                try:
+                    sig = float(bad_cond_pred.detach().float().flatten()[:8192].sum().cpu())
+                    print("[AutoGuidance] bad_cond_pred_sig", sig)
+                except Exception as e:
+                    print("[AutoGuidance] bad_cond_pred_sig failed", repr(e))
+                setattr(self, bad_sig_key, True)
 
             # Keep bad CFG computation consistent with the good path.
             # Some workflows install a sampler_cfg_function (e.g. cfg-rescale, custom thresholding).
