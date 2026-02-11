@@ -123,20 +123,15 @@ def _debug_print_weight_signature_once(model, patcher, *, tag: str, enabled: boo
 
 def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
     """
-    Configure shared-model patchers for faster LoRA stack switching.
-    Uses extra VRAM by retaining a shared weight backup on-device.
+    Configure patchers for faster swapping.
+
+    IMPORTANT:
+    Do NOT share `backup` dicts across patchers. Many Comfy builds clear/replace
+    `backup` inside unpatch_model(), and sharing it causes weight corruption.
+    We still get speed by keeping backups on the target device and enabling
+    inplace updates.
     """
-    shared_backup = getattr(model, "_ag_shared_weight_backup", None)
-    if shared_backup is None:
-        shared_backup = {}
-        setattr(model, "_ag_shared_weight_backup", shared_backup)
-
     for p in (patcher, *peer_patchers):
-        try:
-            p.backup = shared_backup
-        except Exception:
-            pass
-
         if device is not None:
             try:
                 p.offload_device = device
@@ -149,10 +144,22 @@ def _prepare_fast_weight_swap(model, patcher, *, peer_patchers, device) -> None:
             pass
 
 
-def _call_unpatch_model_compat(patcher, *, device) -> None:
+def _call_unpatch_model_compat(patcher, *, device, prefer_device: bool = False) -> None:
     """
-    Unpatch compat across Comfy variants (prefers "cheap" calls first).
+    Unpatch compat across Comfy variants.
+
+    When prefer_device=True, try device-targeted unpatch first to better preserve
+    on-device backup behavior on builds that support it.
     """
+    if prefer_device and device is not None:
+        try:
+            patcher.unpatch_model(device_to=device, unpatch_weights=True)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
     try:
         patcher.unpatch_model(unpatch_weights=True)
         return
@@ -176,82 +183,6 @@ def _call_unpatch_model_compat(patcher, *, device) -> None:
         return
     except Exception:
         patcher.unpatch_model()
-
-
-def _call_patch_model_fast_weightsafe(patcher, *, device) -> bool:
-    """
-    Fast shared-model swap path:
-    1) patch_model(load_weights=False) for object patches and to avoid reload churn.
-    2) explicitly apply weight deltas via patch_weight_to_device for correctness.
-    Returns False when unsupported so caller can fall back to slow/safe path.
-    """
-    fn = patcher.patch_model
-
-    def _is_sig_typeerror(e: TypeError) -> bool:
-        msg = str(e)
-        return (
-            "unexpected keyword argument" in msg
-            or "got an unexpected keyword argument" in msg
-            or "positional argument" in msg
-            or "required positional argument" in msg
-            or "missing a required keyword-only argument" in msg
-            or "missing required keyword-only argument" in msg
-            or "required keyword-only argument" in msg
-            or "got multiple values for argument" in msg
-            or "multiple values for keyword argument" in msg
-            or ("takes" in msg and "positional" in msg)
-        )
-
-    def _try_patch_model(*, minimal: bool) -> bool:
-        kw = {}
-        if not minimal:
-            if device is not None and _sig_accepts_kw(fn, "device_to"):
-                kw["device_to"] = device
-            if _sig_accepts_kw(fn, "lowvram_model_memory"):
-                kw["lowvram_model_memory"] = 0
-
-        if not _sig_accepts_kw(fn, "load_weights"):
-            return False
-        kw["load_weights"] = False
-
-        if _sig_accepts_kw(fn, "force_patch_weights"):
-            kw["force_patch_weights"] = True
-
-        try:
-            fn(**kw)
-            return True
-        except TypeError as e:
-            if _is_sig_typeerror(e):
-                return False
-            raise
-
-    try:
-        if not _try_patch_model(minimal=True):
-            if not _try_patch_model(minimal=False):
-                return False
-    except Exception:
-        return False
-
-    pwt = getattr(patcher, "patch_weight_to_device", None)
-    patches = getattr(patcher, "patches", None)
-    if pwt is None or not isinstance(patches, dict) or not patches:
-        return False
-
-    for key in list(patches.keys()):
-        try:
-            pwt(key, device_to=device, inplace_update=True)
-        except TypeError:
-            try:
-                pwt(key, device, True)
-            except TypeError:
-                try:
-                    pwt(key)
-                except Exception:
-                    return False
-        except Exception:
-            return False
-
-    return True
 
 
 def _activate_patcher_for_forward(
@@ -343,7 +274,7 @@ def _activate_patcher_for_forward(
     def _unpatch_owner_fast(owner) -> None:
         if owner is None:
             return
-        _call_unpatch_model_compat(owner, device=device)
+        _call_unpatch_model_compat(owner, device=device, prefer_device=True)
         m.current_weight_patches_uuid = None
         if getattr(m, "current_patcher", None) is owner:
             m.current_patcher = None
@@ -352,16 +283,43 @@ def _activate_patcher_for_forward(
         cleaned = False
         for candidate in peer_patchers:
             if _patcher_has_active_patches(candidate):
-                _call_unpatch_model_compat(candidate, device=device)
+                _call_unpatch_model_compat(candidate, device=device, prefer_device=fast_mode)
                 cleaned = True
         if cleaned:
             m.current_weight_patches_uuid = None
             if getattr(m, "current_patcher", None) in peer_patchers:
                 m.current_patcher = None
 
-    # Try fast path first when explicitly enabled. Fall back to safe path if unsupported.
+    # Fast mode keeps backups on target device and uses inplace updates, but
+    # still performs correctness-first unpatch/patch calls across Comfy variants.
     if fast_mode:
         _prepare_fast_weight_swap(m, patcher, peer_patchers=peer_patchers, device=device)
+        fast_force_clean = bool(safe_force_clean_swap)
+
+        if fast_force_clean:
+            last_id = getattr(m, "_ag_last_patcher_id_fast", None)
+            if last_id == id(patcher):
+                m.current_patcher = patcher
+                m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+                _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+                return
+
+            for p in (*peer_patchers, patcher):
+                try:
+                    _call_unpatch_model_compat(p, device=device, prefer_device=True)
+                except Exception:
+                    pass
+            m.current_weight_patches_uuid = None
+            m.current_patcher = None
+
+            _call_patch_model_safe(patcher, device=device)
+            m.current_patcher = patcher
+            m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+            m._ag_last_patcher_id_fast = id(patcher)
+            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+            return
+
+        # Less strict: unpatch inferred owner only, still using safe patch_model.
         owner = getattr(m, "current_patcher", None) or cur_owner
         if owner is None:
             inferred_owner, ambiguous = _infer_single_active_owner(all_patchers)
@@ -374,28 +332,11 @@ def _activate_patcher_for_forward(
         elif owner is patcher and cur_uuid != want_uuid:
             _unpatch_owner_fast(patcher)
 
-        if _call_patch_model_fast_weightsafe(patcher, device=device):
-            m.current_patcher = patcher
-            m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
-            _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
-            return
-        else:
-            # Fast attempt may have applied partial object patches; clean up before slow path.
-            try:
-                _call_unpatch_model_compat(patcher, device=device)
-            except Exception:
-                pass
-            m.current_weight_patches_uuid = None
-            if getattr(m, "current_patcher", None) is patcher:
-                m.current_patcher = None
-
-            # Important: user explicitly chose fast mode; tell them if we had to fall back.
-            if not hasattr(m, "_ag_warn_fast_unsupported_once"):
-                print(
-                    "[AutoGuidance] shared_fast_extra_vram selected, but fast weight-swap is unsupported on this ComfyUI build "
-                    "(missing/changed patch_weight_to_device or patch structures). Falling back to shared_safe_low_vram."
-                )
-                m._ag_warn_fast_unsupported_once = True
+        _call_patch_model_safe(patcher, device=device)
+        m.current_patcher = patcher
+        m.current_weight_patches_uuid = getattr(patcher, "patches_uuid", None)
+        _debug_print_weight_signature_once(m, patcher, tag=str(getattr(patcher, "patches_uuid", "none")), enabled=debug_swap)
+        return
 
     def _unpatch_owner(owner) -> None:
         if owner is None:
