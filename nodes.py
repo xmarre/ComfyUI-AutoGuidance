@@ -99,6 +99,16 @@ AG_DELTA_MODE_CHOICES = [
     AG_DELTA_MODE_REJECT_CFG,
 ]
 
+AG_POST_CFG_KEEP = "keep"
+AG_POST_CFG_APPLY_AFTER = "apply_after"
+AG_POST_CFG_SKIP = "skip"
+
+AG_POST_CFG_MODE_CHOICES = [
+    AG_POST_CFG_KEEP,
+    AG_POST_CFG_APPLY_AFTER,
+    AG_POST_CFG_SKIP,
+]
+
 AG_RAMP_FLAT = "flat"
 AG_RAMP_DETAIL_LATE = "detail_late"
 AG_RAMP_COMPOSE_EARLY = "compose_early"
@@ -724,6 +734,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         ag_ramp_mode: str = AG_RAMP_FLAT,
         ag_ramp_power: float = 2.0,
         ag_ramp_floor: float = 0.0,
+        ag_post_cfg_mode: str = AG_POST_CFG_KEEP,
         safe_force_clean_swap: bool = True,
         uuid_only_noop: bool = False,
         debug_swap: bool = False,
@@ -741,6 +752,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.ag_ramp_mode: str = str(ag_ramp_mode)
         self.ag_ramp_power: float = float(ag_ramp_power)
         self.ag_ramp_floor: float = float(ag_ramp_floor)
+        self.ag_post_cfg_mode: str = str(ag_post_cfg_mode)
         self.safe_force_clean_swap: bool = bool(safe_force_clean_swap)
         self.uuid_only_noop: bool = bool(uuid_only_noop)
         self.debug_swap: bool = bool(debug_swap)
@@ -926,7 +938,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     def predict_noise(self, x, timestep, model_options: Dict[str, Any] | None = None, seed=None, **kwargs):
         """
         Mirrors comfy.samplers.sampling_function + cfg_function, but injects
-        AutoGuidance delta BEFORE sampler_post_cfg_function hooks.
+        AutoGuidance delta with configurable post-CFG hook ordering
+        (keep/apply_after/skip via ag_post_cfg_mode).
         """
         if model_options is None:
             model_options = {}
@@ -938,6 +951,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self._ag_step = step + 1
         total_steps = getattr(self, "_ag_steps_total", None)
         last = (total_steps is not None and step == total_steps - 1)
+
+        post_cfg_mode = str(getattr(self, "ag_post_cfg_mode", AG_POST_CFG_KEEP))
+        post_cfg_fns = model_options.get("sampler_post_cfg_function", []) or []
+        if post_cfg_mode == AG_POST_CFG_SKIP:
+            post_cfg_fns = []
 
         # IMPORTANT: do NOT let the bad-model pass mutate shared transformer_options
         # that the good-model pass relies on across timesteps.
@@ -1236,8 +1254,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             dbg = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
             if dbg and step == 0 and not hasattr(self, "_ag_dbg_post_cfg_once"):
                 try:
-                    fns = model_options.get("sampler_post_cfg_function", []) or []
-                    print("[AutoGuidance] post_cfg_functions", [getattr(fn, "__name__", type(fn).__name__) for fn in fns])
+                    print("[AutoGuidance] post_cfg_functions", [getattr(fn, "__name__", type(fn).__name__) for fn in post_cfg_fns])
+                    print("[AutoGuidance] post_cfg_mode", post_cfg_mode)
                 except Exception as e:
                     print("[AutoGuidance] post_cfg_functions failed", repr(e))
                 self._ag_dbg_post_cfg_once = True
@@ -1285,6 +1303,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             d_ag_cfg = cfg_out - bad_cfg_out
             w = max(float(self.w_ag - 1.0), 0.0)
             if w <= 0.0:
+                ag_delta = None
                 denoised = cfg_out
             else:
                 mode = getattr(self, "ag_delta_mode", AG_DELTA_MODE_BAD_CONDITIONAL)
@@ -1385,7 +1404,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
                 denoised = cfg_out + ag_delta
 
-            for fn in model_options.get("sampler_post_cfg_function", []):
+            # If requested, postpone applying AG until after sampler_post_cfg_function hooks.
+            if ag_delta is not None and post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
+                denoised = cfg_out
+
+            denoised_before_post = denoised
+
+            for fn in post_cfg_fns:
                 if shared_model:
                     _activate(self.model_patcher, (self.bad_model_patcher,))
                 self.inner_model.current_patcher = self.model_patcher
@@ -1405,6 +1430,33 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     "autoguidance_w": self.w_ag,
                 }
                 denoised = fn(args)
+
+            denoised_after_post = denoised
+
+            if ag_delta is not None and post_cfg_mode == AG_POST_CFG_APPLY_AFTER:
+                denoised = denoised + ag_delta
+
+            # Debug how much post_cfg altered the result.
+            debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
+            if debug_metrics and (step == 0 or last):
+                try:
+                    def _l2(t):
+                        return float(t.detach().float().pow(2).sum().sqrt().cpu())
+
+                    n_pre = _l2(denoised_before_post - cfg_out)
+                    n_post = _l2(denoised_after_post - cfg_out)
+                    n_change = _l2(denoised_after_post - denoised_before_post)
+                    print(
+                        "[AutoGuidance] post_cfg_effect_step",
+                        step,
+                        {
+                            "n_pre_minus_cfg": n_pre,
+                            "n_post_minus_cfg": n_post,
+                            "n_post_change": n_change,
+                        },
+                    )
+                except Exception as e:
+                    print("[AutoGuidance] post_cfg_effect failed", repr(e))
 
             if shared_model:
                 _activate(self.model_patcher, (self.bad_model_patcher,))
@@ -1464,6 +1516,9 @@ class AutoGuidanceCFGGuider:
                 # Minimum always-on fraction of ag_max_ratio.
                 "ag_ramp_floor": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05, "round": 0.01}),
 
+                # Post-CFG hook handling (useful if a hook normalizes/clamps away AG).
+                "ag_post_cfg_mode": (AG_POST_CFG_MODE_CHOICES, {"default": AG_POST_CFG_KEEP}),
+
                 # === Swap/ownership safety tuning ===
                 # In shared_safe_low_vram mode, force a clean swap every time we switch between good/bad.
                 # This is slower but fixes "washed out" or "same output" issues on some ComfyUI builds.
@@ -1499,6 +1554,7 @@ class AutoGuidanceCFGGuider:
         ag_ramp_mode=AG_RAMP_FLAT,
         ag_ramp_power=2.0,
         ag_ramp_floor=0.15,
+        ag_post_cfg_mode=AG_POST_CFG_KEEP,
         safe_force_clean_swap=True,
         uuid_only_noop=False,
         debug_swap=True,
@@ -1514,6 +1570,7 @@ class AutoGuidanceCFGGuider:
             ag_ramp_mode=ag_ramp_mode,
             ag_ramp_power=ag_ramp_power,
             ag_ramp_floor=ag_ramp_floor,
+            ag_post_cfg_mode=ag_post_cfg_mode,
             safe_force_clean_swap=safe_force_clean_swap,
             uuid_only_noop=uuid_only_noop,
             debug_swap=debug_swap,
