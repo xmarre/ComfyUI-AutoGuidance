@@ -699,6 +699,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
         noise = noise.to(device)
         latent_image = latent_image.to(device)
+        try:
+            v = sigmas[0] if sigmas is not None and len(sigmas) > 0 else None
+            if v is None:
+                self._ag_sigma_max = None
+            elif torch.is_tensor(v):
+                self._ag_sigma_max = float(v.detach().cpu().item())
+            else:
+                self._ag_sigma_max = float(v)
+        except Exception:
+            self._ag_sigma_max = None
         sigmas = sigmas.to(device)
 
         comfy.samplers.cast_to_load_options(self.model_options, device=device, dtype=self.model_patcher.model_dtype())
@@ -1173,9 +1183,21 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 if max_ratio > 0.0:
                     n_cfg = d_cfg.float().pow(2).sum().sqrt() + 1e-8
                     n_delta = ag_delta.float().pow(2).sum().sqrt() + 1e-8
-                    limit = max_ratio * n_cfg
-                    scale = torch.clamp(limit / n_delta, max=1.0)
+                    ratio = max_ratio
+                    sigma_max = getattr(self, "_ag_sigma_max", None)
+                    if sigma_max is not None and sigma_max > 0:
+                        try:
+                            sigma_cur = float(timestep.item())
+                        except Exception:
+                            sigma_cur = float(timestep.detach().cpu().item())
+                        prog = 1.0 - (sigma_cur / sigma_max)  # 0 early -> 1 late
+                        prog = max(0.0, min(1.0, prog))
+                        ratio = max_ratio * (prog * prog)  # quadratic ramp
+
+                    limit = ratio * n_cfg
+                    scale = torch.clamp(limit / (n_delta + 1e-8), max=1.0)
                     ag_delta = ag_delta * scale.to(ag_delta.dtype)
+                    n_applied = ag_delta.float().pow(2).sum().sqrt() + 1e-8
 
                     debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
                     if debug_metrics and not hasattr(self, "_ag_dbg_dir_once"):
@@ -1199,8 +1221,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                                 "w_ag": float(self.w_ag),
                                 "w": float(w),
                                 "ag_max_ratio": float(max_ratio),
+                                "ratio_eff": float(ratio),
+                                "limit": float(limit.detach().cpu()) if torch.is_tensor(limit) else float(limit),
                                 "n_cfg": float(n_cfg.detach().cpu()),
                                 "n_delta": float(n_delta.detach().cpu()),
+                                "n_delta_applied": float(n_applied.detach().cpu()),
                                 "scale": float(scale.detach().cpu()),
                                 "n_good_minus_bad_cond": float(n_cond.detach().cpu()),
                             },
