@@ -36,6 +36,36 @@ def _to_sigma_scalar(v) -> float | None:
         return None
 
 
+def _flatten_per_sample(t: torch.Tensor) -> torch.Tensor:
+    """Flatten all non-batch dimensions into one vector per batch item."""
+    if t.ndim == 0:
+        return t.reshape(1, 1)
+    if t.ndim == 1:
+        return t.reshape(t.shape[0], 1)
+    if t.ndim == 3:
+        return t.reshape(1, -1)
+    return t.reshape(t.shape[0], -1)
+
+
+def _dot_per_sample(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-sample dot product over non-batch dimensions."""
+    af = _flatten_per_sample(a.float())
+    bf = _flatten_per_sample(b.float())
+    return (af * bf).sum(dim=1)
+
+
+def _norm_per_sample(t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Per-sample L2 norm over non-batch dimensions."""
+    return _dot_per_sample(t, t).sqrt() + eps
+
+
+def _expand_batch_scale(scale: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Expand [B] scale to broadcast with ref tensor shape [B,...]."""
+    if ref.ndim <= 1:
+        return scale
+    return scale.reshape(scale.shape[0], *([1] * (ref.ndim - 1)))
+
+
 def _clone_cond_metadata(cond):
     """
     Clone only the conditioning metadata containers, not the tensors.
@@ -1203,21 +1233,41 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             out_good = _run_good(conds_good)
 
-            for fn in model_options.get("sampler_pre_cfg_function", []):
-                if shared_model:
-                    _activate(self.model_patcher, (self.bad_model_patcher,))
-                self.inner_model.current_patcher = self.model_patcher
-                args = {
-                    "conds": conds_good,
-                    "conds_out": out_good,
-                    "cond_scale": self.cfg,
-                    "timestep": timestep,
-                    "input": x,
-                    "sigma": timestep,
-                    "model": self.inner_model,
-                    "model_options": model_options,
-                }
-                out_good = fn(args)
+            def _apply_pre_cfg_hooks(
+                *,
+                conds_list: List[Any],
+                out_list: List[Any],
+                run_model,
+                active_patcher,
+                other_patcher,
+                options: Dict[str, Any],
+            ) -> List[Any]:
+                out_cur = out_list
+                for fn in options.get("sampler_pre_cfg_function", []):
+                    if shared_model:
+                        _activate(active_patcher, (other_patcher,))
+                    run_model.current_patcher = active_patcher
+                    args = {
+                        "conds": conds_list,
+                        "conds_out": out_cur,
+                        "cond_scale": self.cfg,
+                        "timestep": timestep,
+                        "input": x,
+                        "sigma": timestep,
+                        "model": run_model,
+                        "model_options": options,
+                    }
+                    out_cur = fn(args)
+                return out_cur
+
+            out_good = _apply_pre_cfg_hooks(
+                conds_list=conds_good,
+                out_list=out_good,
+                run_model=self.inner_model,
+                active_patcher=self.model_patcher,
+                other_patcher=self.bad_model_patcher,
+                options=model_options,
+            )
 
             cond_pred = out_good[0]
             uncond_pred = out_good[1]
@@ -1327,10 +1377,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     self._ag_dbg_num_tokens_once = True
             conds_bad: List[Any] = [pos_bad_cond, neg_bad]
 
-            bad_model_options_last = None
-
-            def _run_bad(conds_list: List[Any]) -> List[Any]:
-                nonlocal bad_model_options_last
+            def _run_bad(conds_list: List[Any]) -> tuple[List[Any], Dict[str, Any]]:
                 # IMPORTANT: build bad_model_options *after* the good pass and any sampler_pre_cfg hooks.
                 # Some model families (e.g. NextDiT used by Z-Image) inject per-step fields (like num_tokens)
                 # into model_options/transformer_options during the good pass. If we clone too early, the bad
@@ -1339,7 +1386,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 # Keep this clone inside _run_bad so every bad-pass invocation gets a fresh, isolated copy,
                 # including retry paths in the exception handlers below.
                 bad_model_options = _clone_model_options_for_bad(model_options)
-                bad_model_options_last = bad_model_options
                 if shared_model:
                     _activate(self.bad_model_patcher, (self.model_patcher,))
                     if not hasattr(self, "_ag_dbg_flip_bad_once"):
@@ -1362,10 +1408,10 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     x,
                     timestep,
                     bad_model_options,
-                )
+                ), bad_model_options
 
             try:
-                out_bad = _run_bad(conds_bad)
+                out_bad, bad_opts_used = _run_bad(conds_bad)
             except AssertionError as e:
                 if "must specify y if and only if the model is class-conditional" not in str(e):
                     raise
@@ -1380,7 +1426,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     self.bad_conds["negative"] = neg_bad
                 conds_bad = [pos_bad_cond, neg_bad]
                 try:
-                    out_bad = _run_bad(conds_bad)
+                    out_bad, bad_opts_used = _run_bad(conds_bad)
                 except RuntimeError as e2:
                     if "mat1 and mat2 shapes cannot be multiplied" not in str(e2):
                         raise
@@ -1394,7 +1440,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         self.bad_conds["positive"] = pos_bad_cond
                         self.bad_conds["negative"] = neg_bad
                     conds_bad = [pos_bad_cond, neg_bad]
-                    out_bad = _run_bad(conds_bad)
+                    out_bad, bad_opts_used = _run_bad(conds_bad)
             except RuntimeError as e:
                 if "mat1 and mat2 shapes cannot be multiplied" not in str(e):
                     raise
@@ -1408,7 +1454,18 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     self.bad_conds["positive"] = pos_bad_cond
                     self.bad_conds["negative"] = neg_bad
                 conds_bad = [pos_bad_cond, neg_bad]
-                out_bad = _run_bad(conds_bad)
+                out_bad, bad_opts_used = _run_bad(conds_bad)
+            bad_cond_pred = out_bad[0]
+            bad_uncond_pred = out_bad[1]
+
+            out_bad = _apply_pre_cfg_hooks(
+                conds_list=conds_bad,
+                out_list=out_bad,
+                run_model=self.inner_bad_model,
+                active_patcher=self.bad_model_patcher,
+                other_patcher=self.model_patcher,
+                options=bad_opts_used,
+            )
             bad_cond_pred = out_bad[0]
             bad_uncond_pred = out_bad[1]
 
@@ -1445,7 +1502,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     "cond_denoised": bad_cond_pred,
                     "uncond_denoised": bad_uncond_pred,
                     "model": self.inner_bad_model,
-                    "model_options": bad_model_options_last if bad_model_options_last is not None else _clone_model_options_for_bad(model_options),
+                    "model_options": bad_opts_used,
                 }
                 bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
             else:
@@ -1472,19 +1529,19 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
                 # Choose AG direction.
                 if mode == AG_DELTA_MODE_PROJECT_CFG:
-                    cfg_denom = (cfg_update_dir.float() * cfg_update_dir.float()).sum() + 1e-8
+                    cfg_denom = _dot_per_sample(cfg_update_dir, cfg_update_dir)
                     # Project the conditional push-away-from-bad direction onto the actual CFG update direction.
-                    alpha = (d_ag_cond.float() * cfg_update_dir.float()).sum() / cfg_denom
+                    alpha = _dot_per_sample(d_ag_cond, cfg_update_dir) / (cfg_denom + 1e-8)
                     if not allow_neg:
                         alpha = torch.clamp(alpha, min=0.0)
-                    d_ag_dir = cfg_update_dir * alpha.to(cfg_update_dir.dtype)
+                    d_ag_dir = cfg_update_dir * _expand_batch_scale(alpha.to(cfg_update_dir.dtype), cfg_update_dir)
                 elif mode == AG_DELTA_MODE_REJECT_CFG:
                     # Remove CFG-parallel component (w.r.t. actual CFG update) so AG can drive non-CFG structure changes.
-                    cfg_denom = (cfg_update_dir.float() * cfg_update_dir.float()).sum() + 1e-8
-                    alpha = (d_ag_cond.float() * cfg_update_dir.float()).sum() / cfg_denom
+                    cfg_denom = _dot_per_sample(cfg_update_dir, cfg_update_dir)
+                    alpha = _dot_per_sample(d_ag_cond, cfg_update_dir) / (cfg_denom + 1e-8)
                     if not allow_neg:
                         alpha = torch.clamp(alpha, min=0.0)
-                    d_ag_dir = d_ag_cond - cfg_update_dir * alpha.to(cfg_update_dir.dtype)
+                    d_ag_dir = d_ag_cond - cfg_update_dir * _expand_batch_scale(alpha.to(cfg_update_dir.dtype), cfg_update_dir)
                 elif mode == AG_DELTA_MODE_RAW:
                     # Delta between good- and bad-guided outputs.
                     d_ag_dir = d_ag_cfg
@@ -1497,8 +1554,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 # Cap magnitude relative to the actual applied CFG update.
                 max_ratio = float(getattr(self, "ag_max_ratio", AG_DEFAULT_MAX_RATIO))
                 if max_ratio > 0.0:
-                    n_cfg = cfg_update_dir.float().pow(2).sum().sqrt() + 1e-8
-                    n_delta = ag_delta.float().pow(2).sum().sqrt() + 1e-8
+                    n_cfg = _norm_per_sample(cfg_update_dir)
+                    n_delta = _norm_per_sample(ag_delta)
                     ratio = max_ratio
                     sigma_max = getattr(self, "_ag_sigma_max", None)
                     sigma_cur = None
@@ -1516,18 +1573,21 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         ramp_factor = _ag_ramp_factor(prog, mode=ramp_mode, power=ramp_power)
                         ratio = max_ratio * (ramp_floor + (1.0 - ramp_floor) * ramp_factor)
 
-                    limit = ratio * n_cfg
+                    # If cfg_update_dir is nearly zero, use a fallback norm so AG is not silently disabled.
+                    n_cfg_fallback = _norm_per_sample(d_cfg)
+                    n_cfg_ref = torch.where(n_cfg > 1e-6, n_cfg, n_cfg_fallback)
+                    limit = ratio * n_cfg_ref
                     scale = torch.clamp(limit / (n_delta + 1e-8), max=1.0)
-                    ag_delta = ag_delta * scale.to(ag_delta.dtype)
-                    n_applied = ag_delta.float().pow(2).sum().sqrt() + 1e-8
+                    ag_delta = ag_delta * _expand_batch_scale(scale.to(ag_delta.dtype), ag_delta)
+                    n_applied = _norm_per_sample(ag_delta)
 
                     debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
                     if debug_metrics and not hasattr(self, "_ag_dbg_dir_once"):
                         d1 = d_ag_dir.detach().float()
                         d2 = cfg_update_dir.detach().float()
-                        n1 = d1.pow(2).sum().sqrt() + 1e-8
-                        n2 = d2.pow(2).sum().sqrt() + 1e-8
-                        cos = float((d1 * d2).sum().cpu() / (n1 * n2))
+                        n1 = _norm_per_sample(d1).mean()
+                        n2 = _norm_per_sample(d2).mean()
+                        cos = float((_dot_per_sample(d1, d2).mean().cpu()) / (n1 * n2))
                         sig = float(d1.flatten()[:8192].sum().cpu())
                         print("[AutoGuidance] dir", {"cos_ag_vs_cfg_update": cos, "ag_dir_sig": sig})
                         self._ag_dbg_dir_once = True
@@ -1536,7 +1596,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         sigma_cur = _to_sigma_scalar(timestep)
                         # Useful sanity checks: if these are ~0, your bad model path isn't actually different.
                         d_cond = (cond_pred_good - bad_cond_pred).float()
-                        n_cond = d_cond.pow(2).sum().sqrt() + 1e-8
+                        n_cond = _norm_per_sample(d_cond).mean()
                         print(
                             "[AutoGuidance] metrics_step",
                             step,
@@ -1554,11 +1614,11 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                                 "prog": float(prog) if prog is not None else None,
                                 "ramp_factor": float(ramp_factor),
                                 "ratio_eff": float(ratio),
-                                "limit": float(limit.detach().cpu()) if torch.is_tensor(limit) else float(limit),
-                                "n_cfg": float(n_cfg.detach().cpu()),
-                                "n_delta": float(n_delta.detach().cpu()),
-                                "n_delta_applied": float(n_applied.detach().cpu()),
-                                "scale": float(scale.detach().cpu()),
+                                "limit": float(limit.mean().detach().cpu()) if torch.is_tensor(limit) else float(limit),
+                                "n_cfg": float(n_cfg.mean().detach().cpu()),
+                                "n_delta": float(n_delta.mean().detach().cpu()),
+                                "n_delta_applied": float(n_applied.mean().detach().cpu()),
+                                "scale": float(scale.mean().detach().cpu()),
                                 "n_good_minus_bad_cond": float(n_cond.detach().cpu()),
                             },
                         )
