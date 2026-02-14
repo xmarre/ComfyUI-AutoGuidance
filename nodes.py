@@ -888,6 +888,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         uuid_only_noop: bool = False,
         debug_swap: bool = False,
         debug_metrics: bool = False,
+        debug_metrics_all: bool = False,
     ):
         super().__init__(good_model)
         self.bad_model_patcher = bad_model
@@ -907,6 +908,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         self.uuid_only_noop: bool = bool(uuid_only_noop)
         self.debug_swap: bool = bool(debug_swap)
         self.debug_metrics: bool = bool(debug_metrics)
+        self.debug_metrics_all: bool = bool(debug_metrics_all)
 
     def set_conds(self, positive, negative) -> None:
         # Keep the same conditioning dict style used by CFGGuider-based guiders.
@@ -1629,7 +1631,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
                 denoised_after_post = denoised
                 debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
-                if debug_metrics and (step == 0 or last):
+                debug_all = bool(getattr(self, "debug_metrics_all", False)) or (os.environ.get("AG_DEBUG_METRICS_ALL", "0") == "1")
+                if debug_metrics and (debug_all or step == 0 or last):
                     try:
                         def _l2(t):
                             return float(t.detach().float().pow(2).sum().sqrt().cpu())
@@ -1779,7 +1782,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         print("[AutoGuidance] dir", {"cos_ag_vs_cfg_update": cos, "ag_dir_sig": sig})
                         self._ag_dbg_dir_once = True
 
-                    if debug_metrics and (step == 0 or last):
+                    debug_all = bool(getattr(self, "debug_metrics_all", False)) or (os.environ.get("AG_DEBUG_METRICS_ALL", "0") == "1")
+                    if debug_metrics and (debug_all or step == 0 or last):
                         sigma_cur = _to_sigma_scalar(timestep)
                         # Useful sanity checks: if these are ~0, your bad model path isn't actually different.
                         d_cond = (cond_pred_good - bad_cond_pred).float()
@@ -1846,7 +1850,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             # Debug how much post_cfg altered the result (and what we finally return).
             debug_metrics = bool(getattr(self, "debug_metrics", False)) or (os.environ.get("AG_DEBUG_METRICS", "0") == "1")
-            if debug_metrics and (step == 0 or last):
+            debug_all = bool(getattr(self, "debug_metrics_all", False)) or (os.environ.get("AG_DEBUG_METRICS_ALL", "0") == "1")
+            if debug_metrics and (debug_all or step == 0 or last):
                 try:
                     def _l2(t):
                         return float(t.detach().float().pow(2).sum().sqrt().cpu())
@@ -1943,6 +1948,7 @@ class AutoGuidanceCFGGuider:
                 "debug_swap": ("BOOLEAN", {"default": True}),
                 # Print one-time AG magnitude metrics (including good-vs-bad-cond distance).
                 "debug_metrics": ("BOOLEAN", {"default": True}),
+                "debug_metrics_all": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -1971,6 +1977,7 @@ class AutoGuidanceCFGGuider:
         uuid_only_noop=False,
         debug_swap=True,
         debug_metrics=True,
+        debug_metrics_all=False,
     ):
         guider = Guider_AutoGuidanceCFG(
             good_model,
@@ -1988,6 +1995,7 @@ class AutoGuidanceCFGGuider:
             uuid_only_noop=uuid_only_noop,
             debug_swap=debug_swap,
             debug_metrics=debug_metrics,
+            debug_metrics_all=debug_metrics_all,
         )
         # Make swap debugging available inside patcher-level helpers.
         for _p in (good_model, bad_model):
@@ -2194,6 +2202,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
         uuid_only_noop: bool = False,
         debug_swap: bool = False,
         debug_metrics: bool = False,
+        debug_metrics_all: bool = False,
     ):
         super().__init__()
         self.bad_model = bad_model
@@ -2211,6 +2220,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
         self.uuid_only_noop = bool(uuid_only_noop)
         self.debug_swap = bool(debug_swap)
         self.debug_metrics = bool(debug_metrics)
+        self.debug_metrics_all = bool(debug_metrics_all)
 
     def pre_ksample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, upscaled_latent, denoise):
         _ag_try_patch_comfy_samplers_sample()
@@ -2235,6 +2245,7 @@ class AutoGuidanceImpactDetailerHook(_ImpactDetailerHook):
             uuid_only_noop=self.uuid_only_noop,
             debug_swap=self.debug_swap,
             debug_metrics=self.debug_metrics,
+            debug_metrics_all=self.debug_metrics_all,
         )
         try:
             guider.set_conds(positive, negative)
@@ -2281,6 +2292,7 @@ class AutoGuidanceImpactDetailerHookProvider:
                 "uuid_only_noop": ("BOOLEAN", {"default": False}),
                 "debug_swap": ("BOOLEAN", {"default": False}),
                 "debug_metrics": ("BOOLEAN", {"default": False}),
+                "debug_metrics_all": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -2305,6 +2317,7 @@ class AutoGuidanceImpactDetailerHookProvider:
         uuid_only_noop=False,
         debug_swap=False,
         debug_metrics=False,
+        debug_metrics_all=False,
     ):
         hook = AutoGuidanceImpactDetailerHook(
             bad_model,
@@ -2322,6 +2335,7 @@ class AutoGuidanceImpactDetailerHookProvider:
             uuid_only_noop=uuid_only_noop,
             debug_swap=debug_swap,
             debug_metrics=debug_metrics,
+            debug_metrics_all=debug_metrics_all,
         )
         return (hook,)
 
