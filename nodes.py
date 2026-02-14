@@ -1913,7 +1913,7 @@ class AutoGuidanceCFGGuider:
                 "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
                 "ag_max_ratio": (
                     "FLOAT",
-                    {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01},
+                    {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 5.0, "step": 0.05, "round": 0.01},
                 ),
                 # Only affects project_cfg mode; when False, opposite-direction AG becomes 0.
                 "ag_allow_negative": ("BOOLEAN", {"default": True}),
@@ -2271,7 +2271,7 @@ class AutoGuidanceImpactDetailerHookProvider:
             "optional": {
                 "ag_delta_mode": (AG_DELTA_MODE_CHOICES, {"default": AG_DELTA_MODE_BAD_CONDITIONAL}),
                 "ag_combine_mode": (AG_COMBINE_MODE_CHOICES, {"default": AG_COMBINE_MODE_SEQUENTIAL_DELTA}),
-                "ag_max_ratio": ("FLOAT", {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 2.0, "step": 0.05, "round": 0.01}),
+                "ag_max_ratio": ("FLOAT", {"default": AG_DEFAULT_MAX_RATIO, "min": 0.0, "max": 5.0, "step": 0.05, "round": 0.01}),
                 "ag_allow_negative": ("BOOLEAN", {"default": True}),
                 "ag_ramp_mode": (AG_RAMP_MODE_CHOICES, {"default": AG_RAMP_FLAT}),
                 "ag_ramp_power": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 8.0, "step": 0.5, "round": 0.1}),
