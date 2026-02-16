@@ -1217,7 +1217,14 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             conds_good: List[Any] = [positive_cond, uncond_for_good]
             ag_combine_mode = str(getattr(self, "ag_combine_mode", AG_COMBINE_MODE_SEQUENTIAL_DELTA))
-            w_cfg_paper = max(float(self.cfg) - 1.0, 0.0)
+            # Paper-style multi-guidance (Karras et al.) is typically parameterized with
+            # non-negative weights w_cfg,w_ag and uses cfg>=1 as the "no-guidance" baseline.
+            #
+            # In practice it is also useful to run CFG < 1.0 (interpolating towards uncond),
+            # while still using multi-guidance.
+            #
+            # Allow cfg < 1.0 by not clamping (cfg=1.0 -> w_cfg=0, cfg<1.0 -> w_cfg<0).
+            w_cfg_paper = float(self.cfg) - 1.0
             w_ag_paper = max(float(self.w_ag) - 1.0, 0.0)
             cfg_effective_paper = 1.0 + w_cfg_paper + w_ag_paper
             cond_scale_for_pre_cfg = cfg_effective_paper if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER else float(self.cfg)
@@ -1582,9 +1589,16 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 w_sum = w_cfg + w_ag
                 cfg_effective = 1.0 + w_sum
 
-                if w_sum <= 1e-8:
+                # For w_cfg,w_ag>=0, we can express the paper formula via an "origin" and a
+                # standard CFG step (optionally passing through sampler_cfg_function). When
+                # cfg < 1.0, w_cfg becomes negative; the algebra still holds for w_sum!=0 but
+                # the previous implementation short-circuited to cond_pred_good for w_sum<=0.
+                #
+                # Handle the w_sum≈0 edge case with the direct closed-form instead to avoid
+                # division by ~0. For hooks, we still provide a reasonable origin (good uncond).
+                if abs(w_sum) <= 1e-8:
                     origin = uncond_pred_good
-                    denoised = cond_pred_good
+                    denoised = (1.0 + w_sum) * cond_pred_good - (w_cfg * uncond_pred_good) - (w_ag * bad_cond_pred)
                 else:
                     origin = ((w_cfg * uncond_pred_good) + (w_ag * bad_cond_pred)) / w_sum
                     if "sampler_cfg_function" in model_options:
