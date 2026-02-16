@@ -1333,7 +1333,9 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             # Fast path: AG disabled.
             if self.w_ag <= 1.0 + 1e-6:
                 if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
-                    cfg_effective = 1.0 + w_cfg_paper
+                    # IMPORTANT: in paper mode, cfg<1 must remain effective.
+                    # Using (1 + w_cfg_paper) can break if w_cfg_paper is clamped anywhere.
+                    cfg_effective = float(self.cfg)
                     origin = uncond_pred_good
                     if "sampler_cfg_function" in model_options:
                         if shared_model:
@@ -1584,24 +1586,36 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 bad_uncond_pred = out_bad[1]
 
             if ag_combine_mode == AG_COMBINE_MODE_MULTI_GUIDANCE_PAPER:
-                w_cfg = w_cfg_paper
+                cfg = float(self.cfg)
                 w_ag = w_ag_paper
-                w_sum = w_cfg + w_ag
-                cfg_effective = 1.0 + w_sum
 
-                # For w_cfg,w_ag>=0, we can express the paper formula via an "origin" and a
-                # standard CFG step (optionally passing through sampler_cfg_function). When
-                # cfg < 1.0, w_cfg becomes negative; the algebra still holds for w_sum!=0 but
-                # the previous implementation short-circuited to cond_pred_good for w_sum<=0.
-                #
-                # Handle the w_sum≈0 edge case with the direct closed-form instead to avoid
-                # division by ~0. For hooks, we still provide a reasonable origin (good uncond).
-                if abs(w_sum) <= 1e-8:
+                # If no sampler_cfg_function is installed, use the closed-form paper update:
+                # denoised = U + cfg*(C-U) + w_ag*(C-B)
+                # This guarantees cfg<1 changes output (no origin/w_sum edge cases).
+                if "sampler_cfg_function" not in model_options:
+                    denoised = (
+                        uncond_pred_good
+                        + (cond_pred_good - uncond_pred_good) * cfg
+                        + (cond_pred_good - bad_cond_pred) * w_ag
+                    )
                     origin = uncond_pred_good
-                    denoised = (1.0 + w_sum) * cond_pred_good - (w_cfg * uncond_pred_good) - (w_ag * bad_cond_pred)
+                    cfg_effective = cfg
+                    w_cfg = cfg - 1.0
                 else:
-                    origin = ((w_cfg * uncond_pred_good) + (w_ag * bad_cond_pred)) / w_sum
-                    if "sampler_cfg_function" in model_options:
+                    # Keep sampler_cfg_function compatibility via origin+cond_scale form.
+                    w_cfg = cfg - 1.0
+                    w_sum = w_cfg + w_ag
+                    cfg_effective = 1.0 + w_sum
+
+                    if abs(w_sum) <= 1e-8:
+                        origin = uncond_pred_good
+                        denoised = (
+                            (1.0 + w_sum) * cond_pred_good
+                            - (w_cfg * uncond_pred_good)
+                            - (w_ag * bad_cond_pred)
+                        )
+                    else:
+                        origin = ((w_cfg * uncond_pred_good) + (w_ag * bad_cond_pred)) / w_sum
                         if shared_model:
                             _activate(self.model_patcher, (self.bad_model_patcher,))
                         self.inner_model.current_patcher = self.model_patcher
@@ -1618,8 +1632,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                             "model_options": model_options,
                         }
                         denoised = x - model_options["sampler_cfg_function"](args)
-                    else:
-                        denoised = origin + (cond_pred_good - origin) * cfg_effective
 
                 denoised_before_post = denoised
                 for fn in post_cfg_fns:
