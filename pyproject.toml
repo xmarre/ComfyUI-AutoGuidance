@@ -28,7 +28,7 @@ Documentation = "https://github.com/xmarre/ComfyUI-AutoGuidance/wiki"
 "Bug Tracker" = "https://github.com/xmarre/ComfyUI-AutoGuidance/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "xmarre"
 DisplayName = "ComfyUI-AutoGuidance"
 Icon = ""
 includes = [] 
