@@ -7,6 +7,8 @@ A ComfyUI custom node implementing **AutoGuidance** from the paper:
 
 Repository: https://github.com/xmarre/ComfyUI-AutoGuidance
 
+Reddit Thread with more info on usage: https://www.reddit.com/r/StableDiffusion/comments/1r2a7qo/release_comfyuiautoguidance_guide_the_model_with/
+
 ## What this does
 
 Classic CFG steers generation by contrasting conditional and unconditional predictions.  
