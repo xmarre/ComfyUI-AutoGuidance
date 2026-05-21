@@ -107,6 +107,48 @@ def _clone_model_options_for_bad(model_options: Dict[str, Any]) -> Dict[str, Any
     return bad_opts
 
 
+def _is_dynamic_model_patcher(patcher) -> bool:
+    try:
+        is_dynamic = getattr(patcher, "is_dynamic", None)
+        return bool(callable(is_dynamic) and is_dynamic())
+    except Exception:
+        return False
+
+
+def _same_base_model_object(a, b) -> bool:
+    a_model = getattr(a, "model", None)
+    b_model = getattr(b, "model", None)
+    return a_model is not None and a_model is b_model
+
+
+def _non_dynamic_delegate_for_autoguidance(patcher):
+    """
+    Current ComfyUI dynamic ModelPatcher does not support direct patch_model(load_weights=True)
+    from custom nodes. AutoGuidance needs independent good/bad LoRA weight states, so when
+    the bad model shares a dynamic base with the good model, move the bad path to a normal
+    delegate model instead of trying to hot-swap dynamic weights manually.
+    """
+    if not _is_dynamic_model_patcher(patcher):
+        return patcher, False
+
+    get_delegate = getattr(patcher, "get_non_dynamic_delegate", None)
+    if not callable(get_delegate):
+        raise RuntimeError(
+            "AutoGuidance cannot safely swap shared dynamic ComfyUI model patchers: "
+            "this ComfyUI build exposes a dynamic ModelPatcher but no get_non_dynamic_delegate(). "
+            "Load the good/bad models as separate model instances or disable dynamic VRAM for this workflow."
+        )
+
+    delegate = get_delegate()
+    if delegate is None:
+        raise RuntimeError(
+            "AutoGuidance: get_non_dynamic_delegate() returned None for shared dynamic model. "
+            "Load the good/bad models as separate model instances or disable dynamic VRAM for this workflow."
+        )
+
+    return delegate, delegate is not patcher
+
+
 AG_SWAP_MODE_SHARED_SAFE = "shared_safe_low_vram"
 AG_SWAP_MODE_SHARED_FAST = "shared_fast_extra_vram"
 AG_SWAP_MODE_DUAL_MODELS = "dual_models_2x_vram"
@@ -891,7 +933,15 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         debug_metrics_all: bool = False,
     ):
         super().__init__(good_model)
-        self.bad_model_patcher = bad_model
+        bad_model_for_ag = bad_model
+        self._ag_dynamic_bad_delegate = False
+
+        if _same_base_model_object(self.model_patcher, bad_model) and (
+            _is_dynamic_model_patcher(self.model_patcher) or _is_dynamic_model_patcher(bad_model)
+        ):
+            bad_model_for_ag, self._ag_dynamic_bad_delegate = _non_dynamic_delegate_for_autoguidance(bad_model)
+
+        self.bad_model_patcher = bad_model_for_ag
         self.inner_bad_model = None
         self.bad_conds = None
         self.w_ag: float = 1.0  # paper-style weight; (w_ag - 1) is the delta scale
@@ -1125,6 +1175,13 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
             except Exception:
                 pass
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
+
+        if getattr(self, "_ag_dynamic_bad_delegate", False) and not hasattr(self, "_ag_dynamic_delegate_warn_once"):
+            print(
+                "[AutoGuidance] shared dynamic good/bad model detected; using a non-dynamic bad-model "
+                "delegate so good/bad LoRA patch states stay independent under current ComfyUI dynamic VRAM."
+            )
+            self._ag_dynamic_delegate_warn_once = True
 
         def _patch_info(p):
             patches = getattr(p, "patches", None)
