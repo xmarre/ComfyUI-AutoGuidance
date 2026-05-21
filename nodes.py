@@ -140,6 +140,12 @@ def _non_dynamic_delegate_for_autoguidance(patcher):
         )
 
     delegate = get_delegate()
+    if delegate is None:
+        raise RuntimeError(
+            "AutoGuidance: get_non_dynamic_delegate() returned None for shared dynamic model. "
+            "Load the good/bad models as separate model instances or disable dynamic VRAM for this workflow."
+        )
+
     return delegate, delegate is not patcher
 
 
