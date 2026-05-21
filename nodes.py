@@ -968,6 +968,7 @@ def _patch_count_for_debug(patcher) -> int | None:
 
 
 def _dedupe_by_identity(items):
+    """Return items in first-seen order, skipping None and duplicate objects."""
     out = []
     seen = set()
     for item in items:
@@ -992,18 +993,44 @@ def _prepare_autoguidance_sampling_pair(
     force_full_load: bool = False,
     force_offload: bool = False,
 ):
+    """
+    Run prepare-sampling wrappers for each side, then load both sides together.
+
+    WrappersMP.PREPARE_SAMPLING has ComfyUI's single-model positional contract:
+    (model, noise_shape, conds, model_options=...). Keep that contract intact for
+    both good and bad model patchers, then pass the wrapper-adjusted shapes/conds
+    into the joint model-management load.
+    """
     executor = comfy.patcher_extension.WrapperExecutor.new_executor(
-        _prepare_autoguidance_sampling_pair_inner,
+        _prepare_autoguidance_sampling_side,
         comfy.patcher_extension.get_all_wrappers(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
             model_options,
             is_model_options=True,
         ),
     )
-    return executor.execute(
+    good_noise_shape, good_conds = executor.execute(
         good_model,
         noise_shape,
+        good_conds,
+        model_options=model_options,
+        force_full_load=force_full_load,
+        force_offload=force_offload,
+    )
+    bad_noise_shape, bad_conds = executor.execute(
         bad_model,
+        noise_shape,
+        bad_conds,
+        model_options=model_options,
+        force_full_load=force_full_load,
+        force_offload=force_offload,
+    )
+
+    return _prepare_autoguidance_sampling_pair_inner(
+        good_model,
+        bad_model,
+        good_noise_shape,
+        bad_noise_shape,
         good_conds,
         bad_conds,
         model_options=model_options,
@@ -1012,10 +1039,24 @@ def _prepare_autoguidance_sampling_pair(
     )
 
 
+def _prepare_autoguidance_sampling_side(
+    model,
+    noise_shape,
+    conds,
+    model_options=None,
+    *,
+    force_full_load: bool = False,
+    force_offload: bool = False,
+):
+    """Capture wrapper-adjusted prepare-sampling inputs without loading a model."""
+    return noise_shape, conds
+
+
 def _prepare_autoguidance_sampling_pair_inner(
     good_model,
-    noise_shape,
     bad_model,
+    good_noise_shape,
+    bad_noise_shape,
     good_conds,
     bad_conds,
     model_options=None,
@@ -1052,10 +1093,10 @@ def _prepare_autoguidance_sampling_pair_inner(
         minimum_memory_required = None
     else:
         good_memory_required, good_minimum_memory_required = comfy.sampler_helpers.estimate_memory(
-            good_model, noise_shape, good_conds
+            good_model, good_noise_shape, good_conds
         )
         bad_memory_required, bad_minimum_memory_required = comfy.sampler_helpers.estimate_memory(
-            bad_model, noise_shape, bad_conds
+            bad_model, bad_noise_shape, bad_conds
         )
 
         # Only one UNet is evaluated at a time, so activation/inference reservation should
