@@ -938,6 +938,34 @@ def _calc_cond_batch_compat(model, conds_list: List[Any], x, timestep, model_opt
     return comfy.samplers.calc_cond_batch(model, conds_list, x, timestep, model_options)
 
 
+def _baseline_cfg_predict_current_comfy(model, x, timestep, positive_cond, negative_cond, cfg, model_options, seed=None):
+    """
+    Exact current-Comfy CFG baseline for the good model.
+
+    This is used as the safety fallback when AutoGuidance cannot prove that
+    good/bad LoRA patch states are physically independent. It keeps output
+    equivalent to a normal CFGGuider instead of returning a bad/shared-patcher
+    corrupted AG result.
+    """
+    return comfy.samplers.sampling_function(
+        model,
+        x,
+        timestep,
+        negative_cond,
+        positive_cond,
+        float(cfg),
+        model_options=model_options,
+        seed=seed,
+    )
+
+
+def _patch_count_for_debug(patcher) -> int | None:
+    patches = getattr(patcher, "patches", None)
+    if not isinstance(patches, dict):
+        return None
+    return len(patches)
+
+
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     """
     AutoGuidance + CFG guider.
@@ -975,6 +1003,14 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
         if _same_base_model_object(self.model_patcher, bad_model):
             bad_model_for_ag, self._ag_independent_bad_delegate = _independent_delegate_for_autoguidance(bad_model)
+            if not self._ag_independent_bad_delegate:
+                # Do not fail construction: predict_noise has a safe normal-CFG fallback.
+                # Printing here makes it visible even if the first sample aborts before predict_noise.
+                print(
+                    "[AutoGuidance] warning: good/bad models share one physical base and "
+                    "AutoGuidance could not create an independent bad-model delegate. "
+                    "The legacy shared hot-swap path will be blocked by default."
+                )
 
         self.bad_model_patcher = bad_model_for_ag
         self.inner_bad_model = None
@@ -1188,6 +1224,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         # Ensure wrapper-related options always exist
         if model_options.get("transformer_options", None) is None:
             model_options["transformer_options"] = {}
+        baseline_model_options = dict(model_options)
 
         step = int(getattr(self, "_ag_step", 0))
         self._ag_step = step + 1
@@ -1306,6 +1343,38 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
 
             # SDXL needs the extra y/adm inputs; do not use None-uncond optimization.
             uncond_for_good = negative_cond
+
+            # Current ComfyUI's dynamic/managed model loading makes legacy hot-swapping of
+            # two LoRA patch states on one physical model unsafe. If we could not create a
+            # physically independent bad-model delegate, do not run the shared swap path at
+            # all: it can leave the good path with the wrong LoRA state and visually looks
+            # like all LoRAs were stripped. Return the exact normal CFG baseline instead.
+            if shared_model and not getattr(self, "_ag_independent_bad_delegate", False):
+                if os.environ.get("AG_ALLOW_LEGACY_SHARED_SWAP", "0") != "1":
+                    if not hasattr(self, "_ag_warn_shared_swap_disabled_once"):
+                        print(
+                            "[AutoGuidance] unsafe shared good/bad model fallback blocked: "
+                            "good and bad still share one physical model and no independent "
+                            "bad-model delegate was created. Returning normal current-Comfy "
+                            "CFG output instead of hot-swapping LoRA patches. "
+                            "Set AG_ALLOW_LEGACY_SHARED_SWAP=1 only to debug the old path. "
+                            f"good_patches={_patch_count_for_debug(self.model_patcher)} "
+                            f"bad_patches={_patch_count_for_debug(self.bad_model_patcher)} "
+                            f"good_uuid={getattr(self.model_patcher, 'patches_uuid', None)} "
+                            f"bad_uuid={getattr(self.bad_model_patcher, 'patches_uuid', None)}"
+                        )
+                        self._ag_warn_shared_swap_disabled_once = True
+                    self.inner_model.current_patcher = self.model_patcher
+                    return _baseline_cfg_predict_current_comfy(
+                        self.inner_model,
+                        x,
+                        timestep,
+                        positive_cond,
+                        uncond_for_good,
+                        self.cfg,
+                        baseline_model_options,
+                        seed=seed,
+                    )
 
             conds_good: List[Any] = [positive_cond, uncond_for_good]
             ag_combine_mode = str(getattr(self, "ag_combine_mode", AG_COMBINE_MODE_SEQUENTIAL_DELTA))
