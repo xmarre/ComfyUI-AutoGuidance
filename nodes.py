@@ -121,32 +121,56 @@ def _same_base_model_object(a, b) -> bool:
     return a_model is not None and a_model is b_model
 
 
-def _non_dynamic_delegate_for_autoguidance(patcher):
+def _call_cached_patcher_init_disable_dynamic(patcher):
+    cached = getattr(patcher, "cached_patcher_init", None)
+    if not cached:
+        return None
+
+    try:
+        loader, args = cached
+    except Exception:
+        return None
+
+    try:
+        if _sig_accepts_kw(loader, "disable_dynamic"):
+            return loader(*args, disable_dynamic=True)
+        return loader(*args)
+    except Exception as e:
+        print(f"[AutoGuidance] independent delegate load failed: {e!r}")
+        return None
+
+
+def _independent_delegate_for_autoguidance(patcher):
     """
-    Current ComfyUI dynamic ModelPatcher does not support direct patch_model(load_weights=True)
-    from custom nodes. AutoGuidance needs independent good/bad LoRA weight states, so when
-    the bad model shares a dynamic base with the good model, move the bad path to a normal
-    delegate model instead of trying to hot-swap dynamic weights manually.
+    Return a patcher with the same patches/options as `patcher`, but backed by a
+    separate physical model object when ComfyUI exposes enough loader metadata.
+
+    AutoGuidance alternates good and bad LoRA states inside one denoising step.
+    That used to be handled by manually unpatching/repatching shared clones.
+    Recent ComfyUI model-management/dynamic-VRAM paths make that ownership fragile,
+    so prefer a real independent bad model whenever good and bad share one base.
     """
-    if not _is_dynamic_model_patcher(patcher):
+    if _is_dynamic_model_patcher(patcher):
+        get_delegate = getattr(patcher, "get_non_dynamic_delegate", None)
+        if callable(get_delegate):
+            delegate = get_delegate()
+            if delegate is not None and not _same_base_model_object(delegate, patcher):
+                return delegate, True
+
+    fresh_base = _call_cached_patcher_init_disable_dynamic(patcher)
+    if fresh_base is None:
         return patcher, False
 
-    get_delegate = getattr(patcher, "get_non_dynamic_delegate", None)
-    if not callable(get_delegate):
-        raise RuntimeError(
-            "AutoGuidance cannot safely swap shared dynamic ComfyUI model patchers: "
-            "this ComfyUI build exposes a dynamic ModelPatcher but no get_non_dynamic_delegate(). "
-            "Load the good/bad models as separate model instances or disable dynamic VRAM for this workflow."
-        )
+    try:
+        model_override = fresh_base.get_clone_model_override()
+        delegate = patcher.clone(disable_dynamic=True, model_override=model_override)
+    except Exception as e:
+        print(f"[AutoGuidance] independent delegate clone failed: {e!r}")
+        return patcher, False
 
-    delegate = get_delegate()
-    if delegate is None:
-        raise RuntimeError(
-            "AutoGuidance: get_non_dynamic_delegate() returned None for shared dynamic model. "
-            "Load the good/bad models as separate model instances or disable dynamic VRAM for this workflow."
-        )
-
-    return delegate, delegate is not patcher
+    if _same_base_model_object(delegate, patcher):
+        return patcher, False
+    return delegate, True
 
 
 AG_SWAP_MODE_SHARED_SAFE = "shared_safe_low_vram"
@@ -901,6 +925,19 @@ def _ensure_primary_text_cond(dst_cond: Any, src_cond: Any) -> Any:
     return dst_cond
 
 
+def _calc_cond_batch_compat(model, conds_list: List[Any], x, timestep, model_options: Dict[str, Any]) -> List[Any]:
+    if "sampler_calc_cond_batch_function" in model_options:
+        args = {
+            "conds": conds_list,
+            "input": x,
+            "sigma": timestep,
+            "model": model,
+            "model_options": model_options,
+        }
+        return model_options["sampler_calc_cond_batch_function"](args)
+    return comfy.samplers.calc_cond_batch(model, conds_list, x, timestep, model_options)
+
+
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     """
     AutoGuidance + CFG guider.
@@ -934,12 +971,10 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     ):
         super().__init__(good_model)
         bad_model_for_ag = bad_model
-        self._ag_dynamic_bad_delegate = False
+        self._ag_independent_bad_delegate = False
 
-        if _same_base_model_object(self.model_patcher, bad_model) and (
-            _is_dynamic_model_patcher(self.model_patcher) or _is_dynamic_model_patcher(bad_model)
-        ):
-            bad_model_for_ag, self._ag_dynamic_bad_delegate = _non_dynamic_delegate_for_autoguidance(bad_model)
+        if _same_base_model_object(self.model_patcher, bad_model):
+            bad_model_for_ag, self._ag_independent_bad_delegate = _independent_delegate_for_autoguidance(bad_model)
 
         self.bad_model_patcher = bad_model_for_ag
         self.inner_bad_model = None
@@ -1176,12 +1211,12 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 pass
         shared_model = (getattr(self.model_patcher, "model", None) is getattr(self.bad_model_patcher, "model", None))
 
-        if getattr(self, "_ag_dynamic_bad_delegate", False) and not hasattr(self, "_ag_dynamic_delegate_warn_once"):
+        if getattr(self, "_ag_independent_bad_delegate", False) and not hasattr(self, "_ag_independent_delegate_warn_once"):
             print(
-                "[AutoGuidance] shared dynamic good/bad model detected; using a non-dynamic bad-model "
-                "delegate so good/bad LoRA patch states stay independent under current ComfyUI dynamic VRAM."
+                "[AutoGuidance] shared good/bad base model detected; using an independent bad-model "
+                "delegate so LoRA patch states are not hot-swapped on the same physical model."
             )
-            self._ag_dynamic_delegate_warn_once = True
+            self._ag_independent_delegate_warn_once = True
 
         def _patch_info(p):
             patches = getattr(p, "patches", None)
@@ -1302,7 +1337,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     self._ag_uuid_check_good_once = True
                 # Keep hooks/wrappers that consult current_patcher aligned.
                 self.inner_model.current_patcher = self.model_patcher
-                return comfy.samplers.calc_cond_batch(
+                return _calc_cond_batch_compat(
                     self.inner_model,
                     conds_list,
                     x,
@@ -1380,6 +1415,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         "uncond_denoised": uncond_pred_good,
                         "model": self.inner_model,
                         "model_options": model_options,
+                        "input_cond": positive_cond,
+                        "input_uncond": uncond_for_good,
                     }
                     cfg_out = x - model_options["sampler_cfg_function"](args)
                 else:
@@ -1408,6 +1445,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                             "uncond_denoised": origin,
                             "model": self.inner_model,
                             "model_options": model_options,
+                            "input_cond": positive_cond,
+                            "input_uncond": uncond_for_good,
                         }
                         denoised = x - model_options["sampler_cfg_function"](args)
                     else:
@@ -1517,7 +1556,7 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     print("[AutoGuidance] after_bad_activate current_uuid=", getattr(m, "current_weight_patches_uuid", None))
                     self._ag_uuid_check_bad_once = True
                 self.inner_bad_model.current_patcher = self.bad_model_patcher
-                return comfy.samplers.calc_cond_batch(
+                return _calc_cond_batch_compat(
                     self.inner_bad_model,
                     conds_list,
                     x,
@@ -1644,6 +1683,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                         "uncond_denoised": uncond_pred_good,
                         "model": self.inner_model,
                         "model_options": model_options,
+                        "input_cond": positive_cond,
+                        "input_uncond": uncond_for_good,
                     }
                     cfg_out = x - model_options["sampler_cfg_function"](args)
                 else:
@@ -1747,6 +1788,8 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                     "uncond_denoised": bad_uncond_pred,
                     "model": self.inner_bad_model,
                     "model_options": bad_opts_used,
+                    "input_cond": pos_bad_cond,
+                    "input_uncond": neg_bad,
                 }
                 bad_cfg_out = x - model_options["sampler_cfg_function"](args_bad)
             else:
