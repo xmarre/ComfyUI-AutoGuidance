@@ -13,6 +13,7 @@ import comfy.samplers
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.hooks
+import comfy.model_management
 
 
 def _to_sigma_scalar(v) -> float | None:
@@ -966,6 +967,120 @@ def _patch_count_for_debug(patcher) -> int | None:
     return len(patches)
 
 
+def _dedupe_by_identity(items):
+    out = []
+    seen = set()
+    for item in items:
+        if item is None:
+            continue
+        marker = id(item)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(item)
+    return out
+
+
+def _prepare_autoguidance_sampling_pair(
+    good_model,
+    bad_model,
+    noise_shape,
+    good_conds,
+    bad_conds,
+    model_options=None,
+    *,
+    force_full_load: bool = False,
+    force_offload: bool = False,
+):
+    executor = comfy.patcher_extension.WrapperExecutor.new_executor(
+        _prepare_autoguidance_sampling_pair_inner,
+        comfy.patcher_extension.get_all_wrappers(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            model_options,
+            is_model_options=True,
+        ),
+    )
+    return executor.execute(
+        good_model,
+        noise_shape,
+        bad_model,
+        good_conds,
+        bad_conds,
+        model_options=model_options,
+        force_full_load=force_full_load,
+        force_offload=force_offload,
+    )
+
+
+def _prepare_autoguidance_sampling_pair_inner(
+    good_model,
+    noise_shape,
+    bad_model,
+    good_conds,
+    bad_conds,
+    model_options=None,
+    *,
+    force_full_load: bool = False,
+    force_offload: bool = False,
+):
+    """
+    Prepare good and bad model patchers as one ComfyUI model-management request.
+
+    Current ComfyUI's load_models_gpu() detaches already-loaded clone-related models
+    that are not part of the new request. Calling prepare_sampling(good) and then
+    prepare_sampling(bad) can therefore leave the good SDXL model detached/offloaded
+    immediately before sampling. AutoGuidance needs both patchers resident because it
+    alternates good and bad predictions inside each denoising step.
+    """
+    if model_options is None:
+        model_options = {}
+
+    models_good, inference_good = comfy.sampler_helpers.get_additional_models(good_conds, good_model.model_dtype())
+    models_bad, inference_bad = comfy.sampler_helpers.get_additional_models(bad_conds, bad_model.model_dtype())
+
+    additional_models = []
+    additional_models += models_good
+    additional_models += models_bad
+    additional_models += comfy.sampler_helpers.get_additional_models_from_model_options(model_options)
+    additional_models += good_model.get_nested_additional_models()
+    if bad_model is not good_model:
+        additional_models += bad_model.get_nested_additional_models()
+    additional_models = _dedupe_by_identity(additional_models)
+
+    if force_offload:
+        memory_required = 1e20
+        minimum_memory_required = None
+    else:
+        good_memory_required, good_minimum_memory_required = comfy.sampler_helpers.estimate_memory(
+            good_model, noise_shape, good_conds
+        )
+        bad_memory_required, bad_minimum_memory_required = comfy.sampler_helpers.estimate_memory(
+            bad_model, noise_shape, bad_conds
+        )
+
+        # Only one UNet is evaluated at a time, so activation/inference reservation should
+        # be the larger of the two passes. The model weights themselves are accounted for by
+        # passing both patchers to load_models_gpu().
+        memory_required = max(
+            good_memory_required + inference_good,
+            bad_memory_required + inference_bad,
+        )
+        minimum_memory_required = max(
+            good_minimum_memory_required + inference_good,
+            bad_minimum_memory_required + inference_bad,
+        )
+
+    load_models = _dedupe_by_identity([good_model, bad_model] + additional_models)
+    comfy.model_management.load_models_gpu(
+        load_models,
+        memory_required=memory_required,
+        minimum_memory_required=minimum_memory_required,
+        force_full_load=force_full_load,
+    )
+
+    return good_model.model, good_conds, bad_model.model, bad_conds, additional_models
+
+
 class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
     """
     AutoGuidance + CFG guider.
@@ -1050,11 +1165,19 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
         disable_pbar=False,
         seed=None,
     ):
-        self.inner_model, self.conds, loaded_good = comfy.sampler_helpers.prepare_sampling(
-            self.model_patcher, noise.shape, self.conds, self.model_options
-        )
-        self.inner_bad_model, self.bad_conds, loaded_bad = comfy.sampler_helpers.prepare_sampling(
-            self.bad_model_patcher, noise.shape, self.bad_conds, self.model_options
+        (
+            self.inner_model,
+            self.conds,
+            self.inner_bad_model,
+            self.bad_conds,
+            loaded_all,
+        ) = _prepare_autoguidance_sampling_pair(
+            self.model_patcher,
+            self.bad_model_patcher,
+            noise.shape,
+            self.conds,
+            self.bad_conds,
+            self.model_options,
         )
         # SDXL class-conditional models require 'y'. Some hook/filter stacks drop it for the bad model.
         # Restore 'y' per conditioning entry (do NOT merge other tensors like embeddings).
@@ -1068,14 +1191,6 @@ class Guider_AutoGuidanceCFG(comfy.samplers.CFGGuider):
                 bad_positive = _restore_y_per_entry(bad_positive, good_positive, good_negative)
                 self.bad_conds["positive"] = bad_positive
 
-        seen = set()
-        loaded_all = []
-        for model in (loaded_good + loaded_bad):
-            model_id = id(model)
-            if model_id in seen:
-                continue
-            seen.add(model_id)
-            loaded_all.append(model)
         self.loaded_models = loaded_all
 
         device = self.model_patcher.load_device
